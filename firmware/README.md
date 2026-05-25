@@ -39,17 +39,3 @@ OK PLAYING\n
 ERR message\n
 ```
 
-## Voice Path De Xuat
-
-Ban co 2 cach:
-
-### Cach A: DevKit cung co WiFi
-
-DevKit ghi am va upload truc tiep len server. Cach nay tot hon cho audio dai.
-
-### Cach B: DevKit chi la audio peripheral
-
-DevKit gui audio PCM ve ESP32-S3 qua UART, ESP32-S3 upload len server. Cach nay dung dung vai tro "ESP32-S3 connect WiFi, giao tiep server", nhung chi nen ghi am ngan.
-
-Skeleton hien tai dat khung cho Cach B, phan frame PCM can hoan thien theo buffer size va baudrate that te.
-

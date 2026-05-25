@@ -1,7 +1,5 @@
 # ChatBox Server Architecture
 
-Server nay la FastAPI backend trung gian cho he thong:
-
 - ESP32-S3 LCD7: hien thi UI, connect WiFi, goi HTTP API toi server, dieu khien ESP32 DevKit V1 qua UART.
 - ESP32 DevKit V1: thu am tu INMP441 I2S va phat audio ra MAX98357A.
 - Server: nhan text/audio, goi STT/LLM/TTS provider, tra ve text va audio URL.
@@ -29,7 +27,6 @@ Server nay la FastAPI backend trung gian cho he thong:
 8. Server tra ve `transcript`, `reply_text`, `audio_url`.
 9. ESP32-S3 hien thi text va gui UART `PLAY_URL` cho ESP32 DevKit V1 phat loa.
 
-> Ghi chu: Gui raw audio qua UART chi phu hop voi doan ghi am ngan. Neu muon chat voice dai hon, nen cho ESP32 DevKit V1 cung connect WiFi va upload truc tiep.
 
 ## Layer Architecture
 
