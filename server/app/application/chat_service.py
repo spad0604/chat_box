@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+from typing import Optional
 from uuid import uuid4
 
-from app.ports.audio_storage import AudioStoragePort
+from app.ports.chat_store import ChatStorePort
 from app.ports.llm import LlmPort
 from app.ports.stt import SpeechToTextPort
 from app.ports.tts import TextToSpeechPort
@@ -12,16 +15,19 @@ class ChatService:
         llm: LlmPort,
         stt: SpeechToTextPort,
         tts: TextToSpeechPort,
-        audio_storage: AudioStoragePort,
+        chat_store: ChatStorePort,
     ) -> None:
         self._llm = llm
         self._stt = stt
         self._tts = tts
-        self._audio_storage = audio_storage
+        self._chat_store = chat_store
 
-    async def chat_text(self, message: str, session_id: str | None = None) -> dict:
+    async def chat_text(self, message: str, session_id: Optional[str] = None) -> dict:
         session_id = session_id or str(uuid4())
-        reply_text = await self._llm.generate_reply(message=message, session_id=session_id)
+        history = await self._chat_store.get_messages(session_id)
+        reply_text = await self._llm.generate_reply(message=message, session_id=session_id, history=history)
+        await self._chat_store.append_message(session_id, "user", message)
+        await self._chat_store.append_message(session_id, "assistant", reply_text)
         audio_url = await self._synthesize_reply(reply_text)
 
         return {
@@ -36,7 +42,7 @@ class ChatService:
         audio_bytes: bytes,
         filename: str,
         content_type: str,
-        session_id: str | None = None,
+        session_id: Optional[str] = None,
     ) -> dict:
         session_id = session_id or str(uuid4())
         transcript = await self._stt.transcribe(
@@ -44,7 +50,10 @@ class ChatService:
             filename=filename,
             content_type=content_type,
         )
-        reply_text = await self._llm.generate_reply(message=transcript, session_id=session_id)
+        history = await self._chat_store.get_messages(session_id)
+        reply_text = await self._llm.generate_reply(message=transcript, session_id=session_id, history=history)
+        await self._chat_store.append_message(session_id, "user", transcript)
+        await self._chat_store.append_message(session_id, "assistant", reply_text)
         audio_url = await self._synthesize_reply(reply_text)
 
         return {
@@ -55,10 +64,12 @@ class ChatService:
             "audio_url": audio_url,
         }
 
-    async def _synthesize_reply(self, text: str) -> str | None:
-        audio = await self._tts.synthesize(text)
-        if audio is None:
-            return None
-        filename = self._audio_storage.save_wav(audio)
-        return self._audio_storage.public_url(filename)
+    async def _synthesize_reply(self, text: str) -> Optional[str]:
+        return None
+
+    async def get_history(self, session_id: str, limit: int = 50) -> list[dict]:
+        return await self._chat_store.get_messages(session_id, limit=limit)
+
+    async def get_sessions(self, limit: int = 50) -> list[dict]:
+        return await self._chat_store.get_sessions(limit=limit)
 

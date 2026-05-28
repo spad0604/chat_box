@@ -16,3 +16,4 @@ void ui_chat_set_history_callback(ui_chat_history_cb_t cb);
 void ui_chat_add_message(const char *role, const char *message);
 void ui_chat_clear_messages();
 void ui_chat_set_status(const char *status);
+bool ui_chat_is_mic_recording();

@@ -13,7 +13,7 @@ class LocalAudioStorage(AudioStoragePort):
         self._public_base_url = public_base_url.rstrip("/")
 
     def save_wav(self, audio_bytes: bytes) -> str:
-        filename = f"reply_{uuid4().hex}.wav"
+        filename = f"reply_{uuid4().hex}{detect_audio_extension(audio_bytes)}"
         path = self._storage_dir / filename
         path.write_bytes(audio_bytes)
         return filename
@@ -27,4 +27,12 @@ class LocalAudioStorage(AudioStoragePort):
 
     def public_url(self, filename: str) -> str:
         return f"{self._public_base_url}/api/v1/audio/{filename}"
+
+
+def detect_audio_extension(audio_bytes: bytes) -> str:
+    if audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE":
+        return ".wav"
+    if audio_bytes.startswith(b"ID3") or audio_bytes[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return ".mp3"
+    return ".bin"
 

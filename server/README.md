@@ -74,6 +74,44 @@ Mo docs:
 http://localhost:8000/docs
 ```
 
+Test FPT ASR trong Swagger:
+
+```text
+POST /api/v1/asr/fpt
+```
+
+Upload file audio vao field `file`. Can cau hinh:
+
+```env
+FPT_ASR_URL=https://api.fpt.ai/hmi/asr/general
+FPT_ASR_API_KEY=your_api_key
+```
+
+Test FPT TTS trong Swagger:
+
+```text
+POST /api/v1/tts/fpt
+```
+
+Body JSON:
+
+```json
+{
+  "text": "Xin chao sinh vien",
+  "voice": "banmai",
+  "speed": ""
+}
+```
+
+Can cau hinh:
+
+```env
+FPT_TTS_URL=https://api.fpt.ai/hmi/tts/v5
+FPT_TTS_API_KEY=your_api_key
+FPT_TTS_VOICE=banmai
+FPT_TTS_SPEED=
+```
+
 ## Provider Configuration
 
 Mac dinh server dung mock provider de chay duoc ngay:
@@ -82,6 +120,51 @@ Mac dinh server dung mock provider de chay duoc ngay:
 LLM_PROVIDER=mock
 STT_PROVIDER=mock
 TTS_PROVIDER=mock
+```
+
+Dung FPT ASR cho voice chat:
+
+```env
+STT_PROVIDER=fpt
+FPT_ASR_API_KEY=your_api_key
+```
+
+Dung FPT TTS cho moi response tu LLM:
+
+```env
+TTS_PROVIDER=fpt
+FPT_TTS_API_KEY=your_api_key
+FPT_TTS_VOICE=banmai
+FPT_TTS_SPEED=
+```
+
+Dung OpenAI `gpt-4.1`, luu session tren Supabase/Postgres, va tra loi theo tai lieu quy che:
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL=gpt-4.1
+CHAT_STORE_PROVIDER=postgres
+DATABASE_URL=postgresql://user:password@host:6543/postgres
+```
+
+Upload tai lieu quy che trong Swagger:
+
+```text
+POST /api/v1/documents/upload
+```
+
+Sau lan upload dau tien, server tao vector store va luu ID vao:
+
+```text
+storage/openai_vector_store_id.txt
+```
+
+Chat history:
+
+```text
+GET /api/v1/chat/sessions
+GET /api/v1/chat/history/{session_id}
 ```
 
 Khi co API that, tao class moi trong:

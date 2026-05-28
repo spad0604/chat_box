@@ -25,7 +25,6 @@ static lv_style_t style_title;
 static lv_style_t style_title_shadow;
 static lv_style_t style_card;
 static lv_style_t style_pill;
-static lv_style_t style_quick_button;
 static lv_style_t style_icon_orange;
 static lv_style_t style_icon_blue;
 static lv_style_t style_icon_green;
@@ -36,13 +35,6 @@ static lv_style_t style_bot_bubble;
 static lv_style_t style_input;
 static lv_style_t style_send_button;
 static lv_style_t style_close_button;
-
-static const char *history_items[] = {
-    "Tuition Payment",
-    "Student Letter",
-    "Exam Schedule",
-    "Internship Info"
-};
 
 static int16_t disp_w()
 {
@@ -123,16 +115,6 @@ static void init_styles()
     lv_style_set_pad_top(&style_pill, 6);
     lv_style_set_pad_bottom(&style_pill, 6);
     lv_style_set_text_color(&style_pill, lv_color_hex(0xe95100));
-
-    lv_style_init(&style_quick_button);
-    lv_style_set_bg_color(&style_quick_button, lv_color_hex(0xffffff));
-    lv_style_set_bg_opa(&style_quick_button, LV_OPA_80);
-    lv_style_set_radius(&style_quick_button, 18);
-    lv_style_set_border_width(&style_quick_button, 1);
-    lv_style_set_border_color(&style_quick_button, lv_color_hex(0xffccb2));
-    lv_style_set_pad_left(&style_quick_button, 16);
-    lv_style_set_pad_right(&style_quick_button, 16);
-    lv_style_set_text_color(&style_quick_button, lv_color_hex(0xe95100));
 
     lv_style_init(&style_icon_orange);
     lv_style_set_bg_color(&style_icon_orange, lv_color_hex(0xffe5c9));
@@ -391,21 +373,6 @@ static lv_obj_t *make_action_card(lv_obj_t *parent, const char *title, const cha
     return card;
 }
 
-static lv_obj_t *make_quick_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *user_data)
-{
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_remove_style_all(btn);
-    lv_obj_add_style(btn, &style_quick_button, 0);
-    lv_obj_set_width(btn, at_least(sx(172), 142));
-    lv_obj_set_height(btn, at_least(sy(42), 38));
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
-
-    lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_center(label);
-    return btn;
-}
-
 static void draw_dashboard_background(lv_obj_t *screen)
 {
     lv_obj_t *left = make_circle(screen, sx(330), lv_color_hex(0xd9d9d9), LV_OPA_40);
@@ -534,7 +501,7 @@ static void mic_event_cb(lv_event_t *e)
     LV_UNUSED(e);
     mic_is_recording = !mic_is_recording;
     update_mic_recording_ui();
-    if (mic_is_recording && on_mic) {
+    if (on_mic) {
         on_mic();
     }
     ui_chat_set_status(mic_is_recording ? "Listening..." : "Online");
@@ -549,37 +516,6 @@ static void new_chat_event_cb(lv_event_t *e)
     show_chat_screen();
     if (on_new_chat) {
         on_new_chat();
-    }
-}
-
-static void quick_action_event_cb(lv_event_t *e)
-{
-    uintptr_t index = (uintptr_t)lv_event_get_user_data(e);
-    static const char *questions[] = {
-        "How do I pay my tuition?",
-        "I need a student letter.",
-        "Where can I see my exam schedule?",
-        "How do I find internship info?"
-    };
-    static const char *answers[] = {
-        "Visit myuni.fpt.edu.vn -> Finance -> Tuition Payment. The monthly deadline is the 15th. Need more details?",
-        "Open Student Services -> Request Forms -> Student Letter. Choose the template and submit the request online.",
-        "Check Academic Portal -> Exam Schedule. Your room and time are updated there before each exam week.",
-        "Go to Career Services -> Internship Board for current openings, requirements, and application deadlines."
-    };
-
-    if (index >= sizeof(questions) / sizeof(questions[0])) {
-        return;
-    }
-
-    ui_chat_clear_messages();
-    ui_chat_add_message("assistant", "Hi! I'm UniMate. How can I help you today?");
-    ui_chat_add_message("user", questions[index]);
-    ui_chat_add_message("assistant", answers[index]);
-    ui_chat_set_status(history_items[index]);
-    show_chat_screen();
-    if (on_history) {
-        on_history((uint8_t)index);
     }
 }
 
@@ -677,33 +613,6 @@ static void create_dashboard()
     make_action_card(cards, "AI Chat", "AI", &style_icon_orange, new_chat_event_cb, NULL);
     make_action_card(cards, "Voice Assistant", NULL, &style_icon_blue, mic_event_cb, NULL);
     make_action_card(cards, "Campus News", LV_SYMBOL_FILE, &style_icon_green, campus_news_event_cb, NULL);
-
-    lv_obj_t *quick_title = make_label(dashboard_screen, "QUICK ACTIONS", &style_text_muted);
-    lv_obj_align(quick_title, LV_ALIGN_TOP_MID, 0, sy(530));
-
-    lv_obj_t *left_line = plain_obj(dashboard_screen);
-    lv_obj_set_size(left_line, sx(340), 1);
-    lv_obj_align_to(left_line, quick_title, LV_ALIGN_OUT_LEFT_MID, -sx(14), 0);
-    lv_obj_set_style_bg_color(left_line, lv_color_hex(0xcfe0ed), 0);
-    lv_obj_set_style_bg_opa(left_line, LV_OPA_COVER, 0);
-
-    lv_obj_t *right_line = plain_obj(dashboard_screen);
-    lv_obj_set_size(right_line, sx(340), 1);
-    lv_obj_align_to(right_line, quick_title, LV_ALIGN_OUT_RIGHT_MID, sx(14), 0);
-    lv_obj_set_style_bg_color(right_line, lv_color_hex(0xcfe0ed), 0);
-    lv_obj_set_style_bg_opa(right_line, LV_OPA_COVER, 0);
-
-    lv_obj_t *quick = plain_obj(dashboard_screen);
-    lv_obj_set_size(quick, LV_PCT(78), sy(48));
-    lv_obj_align(quick, LV_ALIGN_TOP_MID, 0, sy(558));
-    lv_obj_set_flex_flow(quick, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(quick, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(quick, sx(12), 0);
-    lv_obj_set_style_bg_opa(quick, LV_OPA_TRANSP, 0);
-    make_quick_button(quick, "Tuition Payment", quick_action_event_cb, (void *)(uintptr_t)0);
-    make_quick_button(quick, "Student Letter", quick_action_event_cb, (void *)(uintptr_t)1);
-    make_quick_button(quick, "Exam Schedule", quick_action_event_cb, (void *)(uintptr_t)2);
-    make_quick_button(quick, "Internship Info", quick_action_event_cb, (void *)(uintptr_t)3);
 
     dashboard_mic_ring = make_circle(dashboard_screen, at_least(sx(96), 68), lv_color_hex(0xffd9bd), LV_OPA_60);
     lv_obj_align(dashboard_mic_ring, LV_ALIGN_BOTTOM_MID, 0, -sy(22));
@@ -813,8 +722,6 @@ void ui_chat_init()
     create_chat();
 
     ui_chat_add_message("assistant", "Hi! I'm UniMate. How can I help you today?");
-    ui_chat_add_message("user", "How do I pay my tuition?");
-    ui_chat_add_message("assistant", "Visit myuni.fpt.edu.vn -> Finance -> Tuition Payment. The monthly deadline is the 15th. Need more details?");
 
     lv_scr_load(dashboard_screen);
 }
@@ -871,4 +778,9 @@ void ui_chat_set_status(const char *status)
     if (status_label && status) {
         lv_label_set_text(status_label, status);
     }
+}
+
+bool ui_chat_is_mic_recording()
+{
+    return mic_is_recording;
 }
