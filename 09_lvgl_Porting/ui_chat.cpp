@@ -1,5 +1,7 @@
 #include "ui_chat.h"
 
+#include "font_vietnamese_16.h"
+
 #include <string.h>
 
 static lv_obj_t *dashboard_screen;
@@ -167,6 +169,7 @@ static void init_styles()
     lv_style_set_pad_top(&style_user_bubble, 12);
     lv_style_set_pad_bottom(&style_user_bubble, 12);
     lv_style_set_text_color(&style_user_bubble, lv_color_hex(0xffffff));
+    lv_style_set_text_font(&style_user_bubble, &font_vietnamese_16);
 
     lv_style_init(&style_bot_bubble);
     lv_style_set_bg_color(&style_bot_bubble, lv_color_hex(0xffffff));
@@ -182,6 +185,7 @@ static void init_styles()
     lv_style_set_pad_top(&style_bot_bubble, 12);
     lv_style_set_pad_bottom(&style_bot_bubble, 12);
     lv_style_set_text_color(&style_bot_bubble, lv_color_hex(0x07142d));
+    lv_style_set_text_font(&style_bot_bubble, &font_vietnamese_16);
 
     lv_style_init(&style_input);
     lv_style_set_bg_color(&style_input, lv_color_hex(0xffffff));
@@ -190,6 +194,7 @@ static void init_styles()
     lv_style_set_border_width(&style_input, 1);
     lv_style_set_border_color(&style_input, lv_color_hex(0xe0e5ea));
     lv_style_set_text_color(&style_input, lv_color_hex(0x07142d));
+    lv_style_set_text_font(&style_input, &font_vietnamese_16);
     lv_style_set_pad_left(&style_input, 18);
     lv_style_set_pad_right(&style_input, 18);
     lv_style_set_pad_top(&style_input, 11);
@@ -653,6 +658,7 @@ static void create_chat()
 
     status_label = make_label(header, "Online", NULL);
     lv_obj_set_style_text_color(status_label, lv_color_hex(0x00a75a), 0);
+    lv_obj_set_style_text_font(status_label, &font_vietnamese_16, 0);
     lv_obj_align_to(status_label, chat_title, LV_ALIGN_OUT_BOTTOM_LEFT, 0, sy(6));
 
     lv_obj_t *close_btn = lv_btn_create(header);
@@ -762,6 +768,7 @@ void ui_chat_add_message(const char *role, const char *message)
     lv_label_set_text(label, message);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(label, LV_PCT(100));
+    lv_obj_set_style_text_font(label, &font_vietnamese_16, 0);
 
     lv_obj_scroll_to_view(row, LV_ANIM_ON);
 }

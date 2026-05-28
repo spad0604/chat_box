@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^powershell -NoProfile -Command \"\\$paths=@\\(Join-Path \\$env:USERPROFILE 'Documents\\\\Arduino\\\\libraries', Join-Path \\$env:LOCALAPPDATA 'Arduino15\\\\packages'\\); foreach\\(\\$p in \\$paths\\)\\{ if\\(Test-Path \\$p\\)\\{ Write-Host \\('--SEARCH ROOT: ' \\+ \\$p\\); Get-ChildItem -Path \\$p -Recurse -Filter 'lvgl\\.h' -ErrorAction SilentlyContinue \\| Select-Object -First 10 FullName \\} \\}\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
