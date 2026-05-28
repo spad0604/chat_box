@@ -15,8 +15,8 @@ ESP32-S3 la controller. ESP32 DevKit V1 la audio peripheral.
 Pin theo so do cua ban:
 
 ```text
-ESP32 DevKit V1 RX2 GPIO16  <- HMI_TX tu ESP32-S3
-ESP32 DevKit V1 TX2 GPIO17  -> HMI_RX tu ESP32-S3
+ESP32 DevKit V1 GPIO16 (RX) <- HMI_TX tu ESP32-S3
+ESP32 DevKit V1 GPIO17 (TX) -> HMI_RX tu ESP32-S3
 GND noi chung
 ```
 
@@ -57,13 +57,14 @@ Text chat tren HMI goi:
 POST http://54.206.118.226:8000/api/v1/chat/text
 ```
 
-Pin UART dang dat trong sketch LCD:
+Pin UART dang dat trong sketch LCD (UART1, remap GPIO):
 
 ```text
-ESP32-S3 LCD GPIO17 TX -> ESP32 DevKit GPIO16 RX2
-ESP32-S3 LCD GPIO18 RX <- ESP32 DevKit GPIO17 TX2
+ESP32-S3 LCD GPIO16 TX -> ESP32 DevKit GPIO16 RX
+ESP32-S3 LCD GPIO15 RX <- ESP32 DevKit GPIO17 TX
 GND chung
 ```
 
-Neu GPIO17/GPIO18 tren board LCD bi trung voi phan cung khac, doi `AUDIO_UART_RX` va `AUDIO_UART_TX` trong `09_lvgl_Porting/09_lvgl_Porting.ino`.
+GPIO17/GPIO18 tren board LCD-7 bi trung voi bus data RGB LCD (chay lien tuc), khong dung duoc cho UART.
+Neu ban muon doi sang cap GPIO khac, sua `AUDIO_UART_RX` va `AUDIO_UART_TX` trong `09_lvgl_Porting/09_lvgl_Porting.ino`.
 

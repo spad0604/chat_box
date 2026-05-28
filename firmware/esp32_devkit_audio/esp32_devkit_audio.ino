@@ -24,6 +24,28 @@ static bool mic_test_enabled = false;
 static bool monitor_enabled = false;
 static bool recording_enabled = false;
 static uint32_t last_mic_test_ms = 0;
+static String hmi_line;
+static uint32_t dropped_uart_bytes = 0;
+
+static bool isPrintableCommandByte(uint8_t b)
+{
+    return b == '\n' || b == '\r' || b == ' ' || (b >= '0' && b <= '9') ||
+           (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') ||
+           b == '_' || b == ':' || b == '/' || b == '.' || b == '-';
+}
+
+static bool isKnownCommandPrefix(const String &line)
+{
+    return line == "PING" ||
+           line == "REC_START" ||
+           line == "REC_STOP" ||
+           line == "MIC_TEST" ||
+           line == "MIC_TEST_ON" ||
+           line == "MIC_TEST_OFF" ||
+           line == "MONITOR_ON" ||
+           line == "MONITOR_OFF" ||
+           line.startsWith("PLAY_URL ");
+}
 
 static void setupMic()
 {
@@ -263,9 +285,39 @@ void loop()
         handleCommand(line);
     }
 
-    if (HmiSerial.available()) {
-        String line = HmiSerial.readStringUntil('\n');
-        handleCommand(line);
+    while (HmiSerial.available()) {
+        uint8_t b = HmiSerial.read();
+        if (!isPrintableCommandByte(b)) {
+            dropped_uart_bytes++;
+            hmi_line = "";
+            continue;
+        }
+
+        if (b == '\n') {
+            hmi_line.trim();
+            if (hmi_line.length() > 0) {
+                if (isKnownCommandPrefix(hmi_line)) {
+                    Serial.print("[UART1 CMD] ");
+                    Serial.println(hmi_line);
+                    handleCommand(hmi_line);
+                } else {
+                    Serial.print("[UART1 IGNORE] ");
+                    Serial.println(hmi_line);
+                }
+            }
+            hmi_line = "";
+        } else if (b != '\r') {
+            if (hmi_line.length() < 160) {
+                hmi_line += (char)b;
+            } else {
+                hmi_line = "";
+            }
+        }
+    }
+
+    if (dropped_uart_bytes >= 128) {
+        Serial.printf("[UART1 DROP] %lu non-command bytes. Check wiring/baud/loopback.\n", (unsigned long)dropped_uart_bytes);
+        dropped_uart_bytes = 0;
     }
 
     if (mic_test_enabled && millis() - last_mic_test_ms >= 100) {

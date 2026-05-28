@@ -18,6 +18,7 @@ static bool mic_is_recording;
 static ui_chat_text_cb_t on_send;
 static ui_chat_simple_cb_t on_mic;
 static ui_chat_simple_cb_t on_new_chat;
+static ui_chat_simple_cb_t on_open_history;
 static ui_chat_history_cb_t on_history;
 
 static lv_style_t style_screen;
@@ -535,6 +536,29 @@ static void campus_news_event_cb(lv_event_t *e)
     show_chat_screen();
 }
 
+static void history_open_event_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    ui_chat_clear_messages();
+    ui_chat_add_message("assistant", "Loading chat history...");
+    ui_chat_set_status("History");
+    show_chat_screen();
+    if (on_open_history) {
+        on_open_history();
+    }
+}
+
+static void session_item_event_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    uintptr_t index = (uintptr_t)lv_event_get_user_data(e);
+    if (on_history) {
+        on_history((uint8_t)index);
+    }
+}
+
 static lv_obj_t *create_message_row(const char *role)
 {
     lv_obj_t *row = plain_obj(chat_list);
@@ -587,6 +611,7 @@ static void create_dashboard()
     lv_obj_add_style(bell, &style_close_button, 0);
     lv_obj_set_size(bell, at_least(sx(48), 42), at_least(sx(48), 42));
     lv_obj_align(bell, LV_ALIGN_TOP_RIGHT, -sx(34), sy(20));
+    lv_obj_add_event_cb(bell, history_open_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *bell_label = lv_label_create(bell);
     lv_label_set_text(bell_label, LV_SYMBOL_BELL);
     lv_obj_center(bell_label);
@@ -747,9 +772,47 @@ void ui_chat_set_new_chat_callback(ui_chat_simple_cb_t cb)
     on_new_chat = cb;
 }
 
+void ui_chat_set_open_history_callback(ui_chat_simple_cb_t cb)
+{
+    on_open_history = cb;
+}
+
 void ui_chat_set_history_callback(ui_chat_history_cb_t cb)
 {
     on_history = cb;
+}
+
+void ui_chat_show_sessions(const char *const *titles, uint8_t count)
+{
+    if (!chat_list) {
+        return;
+    }
+
+    lv_obj_clean(chat_list);
+
+    if (!titles || count == 0) {
+        ui_chat_add_message("assistant", "No chat sessions yet.");
+        return;
+    }
+
+    for (uint8_t i = 0; i < count; i++) {
+        const char *title = titles[i] ? titles[i] : "(unknown)";
+
+        lv_obj_t *btn = lv_btn_create(chat_list);
+        lv_obj_remove_style_all(btn);
+        lv_obj_add_style(btn, &style_card, 0);
+        lv_obj_set_width(btn, LV_PCT(100));
+        lv_obj_set_height(btn, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(btn, 14, 0);
+        lv_obj_add_event_cb(btn, session_item_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, title);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_obj_set_style_text_color(label, lv_color_hex(0x07142d), 0);
+        lv_obj_set_style_text_font(label, &font_vietnamese_16, 0);
+    }
 }
 
 void ui_chat_add_message(const char *role, const char *message)

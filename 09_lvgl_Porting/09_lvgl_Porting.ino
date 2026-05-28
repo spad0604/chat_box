@@ -26,13 +26,21 @@ static const uint16_t BITS_PER_SAMPLE = 16;
 static const uint16_t CHANNELS = 1;
 static const size_t MAX_PCM_BYTES = SAMPLE_RATE * 2 * 8;
 
-static String session_id = "esp32-session";
+static String session_id;
 static String pending_text;
 static volatile bool pending_text_send = false;
 static volatile bool pending_voice_toggle = false;
 static bool recording = false;
 static uint8_t *pcm_buffer = nullptr;
 static size_t pcm_len = 0;
+
+static const uint8_t MAX_HISTORY_SESSIONS = 12;
+static String history_session_ids[MAX_HISTORY_SESSIONS];
+static String history_last_messages[MAX_HISTORY_SESSIONS];
+static char history_titles[MAX_HISTORY_SESSIONS][96];
+static const char *history_title_ptrs[MAX_HISTORY_SESSIONS];
+static uint8_t history_session_count = 0;
+static uint32_t session_counter = 0;
 
 static void halt_on_error(const char *message)
 {
@@ -57,6 +65,21 @@ static void ui_add(const char *role, const String &message)
         ui_chat_add_message(role, message.c_str());
         lvgl_port_unlock();
     }
+}
+
+static String newSessionId()
+{
+    uint64_t mac = ESP.getEfuseMac();
+    uint32_t t = millis();
+    session_counter++;
+    char buf[64];
+    // Example: s3-7c9eBD01a2b3-0012-123456
+    snprintf(buf, sizeof(buf), "s3-%04x%08x-%04lu-%lu",
+             (uint16_t)(mac >> 32),
+             (uint32_t)(mac & 0xffffffffULL),
+             (unsigned long)session_counter,
+             (unsigned long)t);
+    return String(buf);
 }
 
 static String jsonEscape(const String &input)
@@ -112,6 +135,141 @@ static String extractJsonString(const String &json, const char *key)
         }
     }
     return out;
+}
+
+static String extractJsonStringFrom(const String &json, int from, const char *key, int *next_pos)
+{
+    String marker = String("\"") + key + "\":";
+    int start = json.indexOf(marker, from);
+    if (start < 0) {
+        return "";
+    }
+    start = json.indexOf('"', start + marker.length());
+    if (start < 0) {
+        return "";
+    }
+
+    String out;
+    bool esc = false;
+    for (int i = start + 1; i < (int)json.length(); i++) {
+        char c = json[i];
+        if (esc) {
+            if (c == 'n') {
+                out += '\n';
+            } else if (c == 'r') {
+                out += '\r';
+            } else if (c == 't') {
+                out += '\t';
+            } else {
+                out += c;
+            }
+            esc = false;
+        } else if (c == '\\') {
+            esc = true;
+        } else if (c == '"') {
+            if (next_pos) {
+                *next_pos = i + 1;
+            }
+            return out;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+static String httpGet(const String &path)
+{
+    if (!ensureWiFi()) {
+        return "";
+    }
+
+    WiFiClient client;
+    client.setTimeout(30000);
+    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+        Serial.println("HTTP connect failed");
+        return "";
+    }
+
+    client.print("GET ");
+    client.print(path);
+    client.print(" HTTP/1.1\r\nHost: ");
+    client.print(SERVER_HOST);
+    client.print(":");
+    client.print(SERVER_PORT);
+    client.print("\r\nConnection: close\r\n\r\n");
+
+    int status = 0;
+    String body = readHttpResponse(client, &status);
+    client.stop();
+
+    Serial.printf("GET %s -> %d\n", path.c_str(), status);
+    if (status < 200 || status >= 300) {
+        return "";
+    }
+    return body;
+}
+
+static String truncateForTitle(const String &s, size_t max_len)
+{
+    String out = s;
+    out.replace("\n", " ");
+    out.replace("\r", " ");
+    out.trim();
+    if (out.length() <= max_len) {
+        return out;
+    }
+    return out.substring(0, (int)max_len - 3) + "...";
+}
+
+static uint8_t refreshHistorySessions()
+{
+    history_session_count = 0;
+
+    String body = httpGet("/api/v1/chat/sessions?limit=12");
+    if (body.length() == 0) {
+        return 0;
+    }
+
+    int pos = 0;
+    while (history_session_count < MAX_HISTORY_SESSIONS) {
+        String sid = extractJsonStringFrom(body, pos, "session_id", &pos);
+        if (sid.length() == 0) {
+            break;
+        }
+        String last = extractJsonStringFrom(body, pos, "last_message", &pos);
+        if (last.length() == 0) {
+            last = sid;
+        }
+
+        history_session_ids[history_session_count] = sid;
+        history_last_messages[history_session_count] = last;
+
+        String title = String(history_session_count + 1) + ". " + truncateForTitle(last, 72);
+        snprintf(history_titles[history_session_count], sizeof(history_titles[history_session_count]), "%s", title.c_str());
+        history_title_ptrs[history_session_count] = history_titles[history_session_count];
+        history_session_count++;
+    }
+
+    return history_session_count;
+}
+
+static void showHistorySessionsInUi()
+{
+    ui_status("History");
+    if (!refreshHistorySessions()) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_clear_messages();
+            ui_chat_add_message("assistant", "Khong tai duoc danh sach lich su. Kiem tra WiFi/API.");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+
+    if (lvgl_port_lock(400)) {
+        ui_chat_show_sessions(history_title_ptrs, history_session_count);
+        lvgl_port_unlock();
+    }
 }
 
 static String absoluteAudioUrl(String audio_url)
@@ -317,6 +475,11 @@ static void handleChatResponse(const String &body)
         return;
     }
 
+    String returned_session = extractJsonString(body, "session_id");
+    if (returned_session.length() > 0) {
+        session_id = returned_session;
+    }
+
     String reply = extractJsonString(body, "reply_text");
     String transcript = extractJsonString(body, "transcript");
     String audio_url = extractJsonString(body, "audio_url");
@@ -355,12 +518,66 @@ static void handle_mic()
 static void handle_new_chat()
 {
     Serial.println("New chat");
+    session_id = newSessionId();
+    Serial.print("Session: ");
+    Serial.println(session_id);
 }
 
 static void handle_history(uint8_t index)
 {
     Serial.print("Open history index: ");
     Serial.println(index);
+
+    if (index >= history_session_count) {
+        return;
+    }
+
+    String selected_session = history_session_ids[index];
+    if (selected_session.length() == 0) {
+        return;
+    }
+
+    session_id = selected_session;
+    ui_status("Loading...");
+
+    String path = "/api/v1/chat/history/" + selected_session + "?limit=50";
+    String body = httpGet(path);
+    if (body.length() == 0) {
+        ui_add("assistant", "Khong tai duoc lich su. Kiem tra WiFi/API.");
+        ui_status("Error");
+        return;
+    }
+
+    if (lvgl_port_lock(600)) {
+        ui_chat_clear_messages();
+        lvgl_port_unlock();
+    }
+
+    int pos = 0;
+    uint16_t added = 0;
+    while (added < 60) {
+        String role = extractJsonStringFrom(body, pos, "role", &pos);
+        if (role.length() == 0) {
+            break;
+        }
+        String content = extractJsonStringFrom(body, pos, "content", &pos);
+        if (content.length() == 0) {
+            content = "(empty)";
+        }
+
+        if (lvgl_port_lock(300)) {
+            ui_chat_add_message(role.c_str(), content.c_str());
+            lvgl_port_unlock();
+        }
+        added++;
+    }
+    ui_status("History");
+}
+
+static void handle_open_history()
+{
+    Serial.println("Open history");
+    showHistorySessionsInUi();
 }
 
 /**
@@ -433,8 +650,14 @@ void setup()
     ui_chat_set_send_callback(handle_send);
     ui_chat_set_mic_callback(handle_mic);
     ui_chat_set_new_chat_callback(handle_new_chat);
+    ui_chat_set_open_history_callback(handle_open_history);
     ui_chat_set_history_callback(handle_history);
     ui_chat_init();
+
+    // Initialize a default session id at boot; a new one will be created on each "New chat".
+    if (session_id.length() == 0) {
+        session_id = newSessionId();
+    }
 
     /* Release the mutex */
     lvgl_port_unlock();

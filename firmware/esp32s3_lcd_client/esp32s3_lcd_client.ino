@@ -7,9 +7,11 @@ static const char *WIFI_SSID = "YOUR_WIFI";
 static const char *WIFI_PASSWORD = "YOUR_PASSWORD";
 static const char *SERVER_BASE_URL = "http://192.168.1.10:8000";
 
-static HardwareSerial AudioSerial(2);
-static const int AUDIO_UART_RX = 18;
-static const int AUDIO_UART_TX = 17;
+static HardwareSerial AudioSerial(1);
+// GPIO17/18 are used by the RGB LCD data bus on Waveshare ESP32-S3 LCD-7.
+// Use different GPIOs for the UART link to the audio board.
+static const int AUDIO_UART_RX = 15;
+static const int AUDIO_UART_TX = 16;
 static const uint32_t AUDIO_UART_BAUD = 921600;
 
 static void connectWiFi()
