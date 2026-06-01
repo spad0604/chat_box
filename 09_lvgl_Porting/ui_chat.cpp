@@ -613,7 +613,7 @@ static void create_dashboard()
     lv_obj_align(bell, LV_ALIGN_TOP_RIGHT, -sx(34), sy(20));
     lv_obj_add_event_cb(bell, history_open_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *bell_label = lv_label_create(bell);
-    lv_label_set_text(bell_label, LV_SYMBOL_BELL);
+    lv_label_set_text(bell_label, LV_SYMBOL_LOOP);
     lv_obj_center(bell_label);
 
     lv_obj_t *badge = make_circle(bell, at_least(sx(19), 17), lv_color_hex(0xff6b13), LV_OPA_COVER);

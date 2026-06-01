@@ -9,6 +9,7 @@ from app.infrastructure.providers.mock_stt import MockSpeechToTextProvider
 from app.infrastructure.providers.mock_tts import MockTextToSpeechProvider
 from app.infrastructure.providers.openai_llm import OpenAiLlmProvider
 from app.infrastructure.storage.local_audio_storage import LocalAudioStorage
+from app.infrastructure.storage.admin_store import PostgresAdminStore
 from app.infrastructure.storage.memory_chat_store import MemoryChatStore
 from app.infrastructure.storage.postgres_chat_store import PostgresChatStore
 from app.ports.audio_storage import AudioStoragePort
@@ -77,11 +78,17 @@ def get_chat_store() -> ChatStorePort:
     raise ValueError(f"Unsupported chat store provider: {settings.chat_store_provider}")
 
 
+@lru_cache
+def get_admin_store() -> PostgresAdminStore:
+    return PostgresAdminStore(settings.database_url)
+
+
 def get_chat_service() -> ChatService:
     return ChatService(
         llm=get_llm_provider(),
         stt=get_stt_provider(),
         tts=get_tts_provider(),
         chat_store=get_chat_store(),
+        audio_storage=get_audio_storage(),
     )
 

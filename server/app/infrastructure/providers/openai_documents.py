@@ -53,6 +53,23 @@ class OpenAiDocumentProvider:
             "status": vector_file_payload.get("status", "in_progress"),
         }
 
+    async def delete_document(self, vector_store_id: str, file_id: str) -> None:
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            vector_response = await client.delete(
+                f"https://api.openai.com/v1/vector_stores/{vector_store_id}/files/{file_id}",
+                headers=headers,
+            )
+            if vector_response.status_code not in (200, 404):
+                vector_response.raise_for_status()
+
+            file_response = await client.delete(
+                f"https://api.openai.com/v1/files/{file_id}",
+                headers=headers,
+            )
+            if file_response.status_code not in (200, 404):
+                file_response.raise_for_status()
+
     async def _get_or_create_vector_store_id(self, client: httpx.AsyncClient, headers: dict[str, str]) -> str:
         if self._vector_store_id:
             return self._vector_store_id

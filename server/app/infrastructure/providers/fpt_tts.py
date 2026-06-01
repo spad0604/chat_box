@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -47,14 +49,15 @@ class FptTtsProvider(TextToSpeechPort):
 
             content_type = response.headers.get("content-type", "")
             if content_type.startswith("audio/"):
-                return response.content
+                return await convert_audio_to_wav(response.content)
 
             payload = response.json()
             audio_url = extract_audio_url(payload)
             if not audio_url:
                 raise ValueError(f"FPT TTS response did not include audio URL: {payload}")
 
-            return await self._download_audio(client, audio_url)
+            audio = await self._download_audio(client, audio_url)
+            return await convert_audio_to_wav(audio)
 
     async def _download_audio(self, client: httpx.AsyncClient, audio_url: str) -> bytes:
         last_error: Optional[Exception] = None
@@ -99,3 +102,49 @@ def extract_audio_url(payload: dict[str, Any]) -> str:
         return extract_audio_url(data)
 
     return ""
+
+
+async def convert_audio_to_wav(audio_bytes: bytes) -> bytes:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        input_path = temp_path / "tts_input.audio"
+        output_path = temp_path / "tts_output.wav"
+        input_path.write_bytes(audio_bytes)
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-codec:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            logger.warning("ffmpeg is not installed; returning original FPT TTS audio")
+            return audio_bytes
+
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.warning("FPT TTS ffmpeg convert failed: %s", stderr.decode("utf-8", errors="replace").strip())
+            return audio_bytes
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            logger.warning("FPT TTS ffmpeg convert produced an empty file")
+            return audio_bytes
+
+        return output_path.read_bytes()

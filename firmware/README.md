@@ -57,11 +57,11 @@ Text chat tren HMI goi:
 POST http://54.206.118.226:8000/api/v1/chat/text
 ```
 
-Pin UART dang dat trong sketch LCD (UART1, remap GPIO):
+Pin UART dang dat trong sketch LCD:
 
 ```text
-ESP32-S3 LCD GPIO16 TX -> ESP32 DevKit GPIO16 RX
-ESP32-S3 LCD GPIO15 RX <- ESP32 DevKit GPIO17 TX
+ESP32-S3 LCD UART TX GPIO43 -> ESP32 DevKit GPIO16 RX2
+ESP32-S3 LCD UART RX GPIO44 <- ESP32 DevKit GPIO17 TX2
 GND chung
 ```
 

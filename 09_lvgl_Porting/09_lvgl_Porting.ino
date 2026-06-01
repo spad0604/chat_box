@@ -16,10 +16,10 @@ static const char *SERVER_HOST = "54.206.118.226";
 static const uint16_t SERVER_PORT = 8000;
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
 
-static HardwareSerial AudioSerial(2);
-static const int AUDIO_UART_RX = 18;
-static const int AUDIO_UART_TX = 17;
-static const uint32_t AUDIO_UART_BAUD = 921600;
+static HardwareSerial AudioSerial(1);
+static const int AUDIO_UART_RX = 44;
+static const int AUDIO_UART_TX = 43;
+static const uint32_t AUDIO_UART_BAUD = 460800;
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
@@ -283,14 +283,240 @@ static String absoluteAudioUrl(String audio_url)
     return audio_url;
 }
 
+static bool extractServerPath(const String &url, String &path)
+{
+    String base = String(SERVER_BASE_URL);
+    if (url.startsWith(base)) {
+        path = url.substring(base.length());
+        if (!path.startsWith("/")) {
+            path = "/" + path;
+        }
+        return true;
+    }
+    if (url.startsWith("/")) {
+        path = url;
+        return true;
+    }
+    return false;
+}
+
+static uint16_t readLe16FromBytes(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t readLe32FromBytes(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void sendSpeakerFrame(const uint8_t *data, uint16_t len)
+{
+    static const uint8_t header[] = {'S', 'P', 'K', '0'};
+    uint8_t len_bytes[2] = {
+        (uint8_t)(len & 0xff),
+        (uint8_t)(len >> 8),
+    };
+    AudioSerial.write(header, sizeof(header));
+    AudioSerial.write(len_bytes, sizeof(len_bytes));
+    AudioSerial.write(data, len);
+}
+
+static bool waitForAudioBoardAck(const char *expected, uint32_t timeout_ms)
+{
+    String line;
+    uint32_t start = millis();
+    while (millis() - start < timeout_ms) {
+        while (AudioSerial.available()) {
+            char c = (char)AudioSerial.read();
+            if (c == '\n') {
+                line.trim();
+                if (line == expected) {
+                    Serial.print("Audio board ack: ");
+                    Serial.println(line);
+                    return true;
+                }
+                if (line.length() > 0) {
+                    Serial.print("Audio board event: ");
+                    Serial.println(line);
+                }
+                line = "";
+            } else if (c != '\r') {
+                if (line.length() < 80) {
+                    line += c;
+                }
+            }
+        }
+        delay(1);
+    }
+
+    Serial.print("Timeout waiting for audio board ack: ");
+    Serial.println(expected);
+    return false;
+}
+
+static bool readClientBytes(WiFiClient &client, uint8_t *buffer, size_t len, uint32_t timeout_ms)
+{
+    size_t pos = 0;
+    uint32_t start = millis();
+    while (pos < len && millis() - start < timeout_ms) {
+        while (client.available() && pos < len) {
+            buffer[pos++] = (uint8_t)client.read();
+            start = millis();
+        }
+        delay(1);
+    }
+    return pos == len;
+}
+
+static bool streamWavUrlToAudioBoard(const String &audio_url)
+{
+    String path;
+    if (!extractServerPath(audio_url, path)) {
+        Serial.print("Unsupported audio URL: ");
+        Serial.println(audio_url);
+        return false;
+    }
+    if (!ensureWiFi()) {
+        return false;
+    }
+
+    WiFiClient client;
+    client.setTimeout(30000);
+    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+        Serial.println("Audio HTTP connect failed");
+        return false;
+    }
+
+    client.print("GET ");
+    client.print(path);
+    client.print(" HTTP/1.1\r\nHost: ");
+    client.print(SERVER_HOST);
+    client.print(":");
+    client.print(SERVER_PORT);
+    client.print("\r\nConnection: close\r\n\r\n");
+
+    String status_line = client.readStringUntil('\n');
+    status_line.trim();
+    int status = 0;
+    int first_space = status_line.indexOf(' ');
+    if (first_space >= 0 && first_space + 4 <= (int)status_line.length()) {
+        status = status_line.substring(first_space + 1, first_space + 4).toInt();
+    }
+
+    while (client.connected()) {
+        String line = client.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) {
+            break;
+        }
+    }
+
+    if (status < 200 || status >= 300) {
+        Serial.printf("Audio GET %s -> %d\n", path.c_str(), status);
+        client.stop();
+        return false;
+    }
+
+    uint8_t wav_header[44];
+    if (!readClientBytes(client, wav_header, sizeof(wav_header), 5000)) {
+        Serial.println("Audio WAV header read failed");
+        client.stop();
+        return false;
+    }
+
+    if (memcmp(wav_header, "RIFF", 4) != 0 || memcmp(wav_header + 8, "WAVE", 4) != 0 ||
+        memcmp(wav_header + 12, "fmt ", 4) != 0 || memcmp(wav_header + 36, "data", 4) != 0) {
+        Serial.println("Audio file is not canonical WAV");
+        client.stop();
+        return false;
+    }
+
+    uint16_t audio_format = readLe16FromBytes(wav_header + 20);
+    uint16_t channels = readLe16FromBytes(wav_header + 22);
+    uint32_t sample_rate = readLe32FromBytes(wav_header + 24);
+    uint16_t bits = readLe16FromBytes(wav_header + 34);
+    uint32_t data_len = readLe32FromBytes(wav_header + 40);
+    if (audio_format != 1 || channels != 1 || sample_rate != 16000 || bits != 16) {
+        Serial.printf("Unsupported WAV fmt format=%u ch=%u rate=%lu bits=%u\n",
+                      audio_format, channels, (unsigned long)sample_rate, bits);
+        client.stop();
+        return false;
+    }
+
+    Serial.println("Sending PLAY_PCM_START to audio board");
+    AudioSerial.print("PLAY_PCM_START\n");
+    if (!waitForAudioBoardAck("OK PLAY_PCM_START", 2000)) {
+        client.stop();
+        return false;
+    }
+
+    uint8_t chunk[512];
+    uint32_t remaining = data_len;
+    while ((client.connected() || client.available()) && remaining > 0) {
+        size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+        if (!readClientBytes(client, chunk, want, 5000)) {
+            break;
+        }
+        sendSpeakerFrame(chunk, (uint16_t)want);
+        remaining -= want;
+        delay(1);
+    }
+    Serial.println("Sending PLAY_PCM_STOP to audio board");
+    AudioSerial.print("PLAY_PCM_STOP\n");
+    waitForAudioBoardAck("OK PLAY_PCM_STOP", 2000);
+    client.stop();
+    Serial.printf("Audio streamed, requested=%lu remaining=%lu\n", (unsigned long)data_len, (unsigned long)remaining);
+    return remaining == 0;
+}
+
+static void handleUsbCommand(String line)
+{
+    line.trim();
+    if (line.length() == 0) {
+        return;
+    }
+
+    Serial.print("[USB CMD] ");
+    Serial.println(line);
+
+    if (line == "PING") {
+        Serial.println("OK PONG");
+    } else if (line == "REC_START") {
+        AudioSerial.print("REC_START\n");
+        Serial.println("[UART->AUDIO] REC_START");
+    } else if (line == "REC_STOP") {
+        AudioSerial.print("REC_STOP\n");
+        Serial.println("[UART->AUDIO] REC_STOP");
+    } else if (line == "PLAY_PCM_START") {
+        AudioSerial.print("PLAY_PCM_START\n");
+        Serial.println("[UART->AUDIO] PLAY_PCM_START");
+    } else if (line == "PLAY_PCM_STOP") {
+        AudioSerial.print("PLAY_PCM_STOP\n");
+        Serial.println("[UART->AUDIO] PLAY_PCM_STOP");
+    } else if (line.startsWith("PLAY_URL ")) {
+        String url = line.substring(9);
+        playAudioUrl(url);
+    } else {
+        Serial.println("Unknown USB command");
+    }
+}
+
 static void playAudioUrl(const String &audio_url)
 {
     if (audio_url.length() == 0) {
         return;
     }
+    String url = absoluteAudioUrl(audio_url);
+    ui_status("Speaking...");
     AudioSerial.print("PLAY_URL ");
-    AudioSerial.print(absoluteAudioUrl(audio_url));
+    AudioSerial.print(url);
     AudioSerial.print("\n");
+    Serial.print("[UART->AUDIO] PLAY_URL ");
+    Serial.println(url);
 }
 
 static bool ensureWiFi()
@@ -592,6 +818,9 @@ void setup()
 
     Serial.begin(115200);
     AudioSerial.begin(AUDIO_UART_BAUD, SERIAL_8N1, AUDIO_UART_RX, AUDIO_UART_TX);
+    AudioSerial.print("HMI_UART_TEST\n");
+    Serial.printf("[HMI UART] begin RX=%d TX=%d baud=%lu\n", AUDIO_UART_RX, AUDIO_UART_TX, (unsigned long)AUDIO_UART_BAUD);
+    Serial.println("[HMI UART TX] HMI_UART_TEST");
     delay(100);
     Serial.printf("PSRAM size: %u bytes\n", ESP.getPsramSize());
     if (ESP.getPsramSize() == 0) {
@@ -690,6 +919,9 @@ void loop()
                     if (uart_line.length() > 0) {
                         Serial.print("Audio board: ");
                         Serial.println(uart_line);
+                        if (uart_line == "OK PLAY_DONE" || uart_line == "OK PLAY_URL_DONE") {
+                            ui_status("Online");
+                        }
                     }
                     uart_line = "";
                 } else if (b != '\r' && uart_line.length() < 80) {
@@ -718,6 +950,11 @@ void loop()
         }
     }
 
+    if (Serial.available()) {
+        String line = Serial.readStringUntil('\n');
+        handleUsbCommand(line);
+    }
+
     if (pending_text_send) {
         pending_text_send = false;
         sendTextToServer(pending_text);
@@ -730,11 +967,13 @@ void loop()
             pcm_len = 0;
             recording = true;
             AudioSerial.print("REC_START\n");
+            Serial.println("[HMI UART TX] REC_START");
             ui_status("Recording...");
             Serial.println("REC_START sent");
         } else if (!should_record && recording) {
             recording = false;
             AudioSerial.print("REC_STOP\n");
+            Serial.println("[HMI UART TX] REC_STOP");
             ui_status("Uploading...");
             Serial.printf("REC_STOP sent, pcm=%u\n", (unsigned)pcm_len);
             handleChatResponse(postVoiceWav());

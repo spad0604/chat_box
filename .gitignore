@@ -1,3 +1,17 @@
 # Python virtual environments
 .vevn/
 .venv/
+__pycache__/
+*.pyc
+
+# JavaScript dependencies and local logs
+node_modules/
+.expo/
+dist/
+*.log
+*.tgz
+*.tar.gz
+
+# Local environment files and temporary exports
+.env
+tmp_sch/

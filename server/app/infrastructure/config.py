@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     app_name: str = "ChatBox Server"
     app_env: str = "dev"
     public_base_url: str = "http://localhost:8000"
+    cors_allow_origins: str = "*"
 
     llm_provider: str = "mock"
     stt_provider: str = "mock"
@@ -16,6 +17,7 @@ class Settings(BaseSettings):
     chat_store_provider: str = "memory"
 
     audio_storage_dir: str = "storage/audio"
+    voice_upload_dir: str = "storage/uploads"
     database_url: str = ""
 
     openai_api_key: str = ""
@@ -31,7 +33,7 @@ class Settings(BaseSettings):
     fpt_tts_api_key: str = ""
     fpt_tts_voice: str = "banmai"
     fpt_tts_speed: str = ""
-    fpt_tts_poll_attempts: int = 45
+    fpt_tts_poll_attempts: int = 90
     fpt_tts_poll_interval_seconds: float = 1.0
 
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 from uuid import uuid4
 
 from app.ports.chat_store import ChatStorePort
+from app.ports.audio_storage import AudioStoragePort
 from app.ports.llm import LlmPort
 from app.ports.stt import SpeechToTextPort
 from app.ports.tts import TextToSpeechPort
+
+logger = logging.getLogger(__name__)
 
 
 class ChatService:
@@ -16,11 +20,13 @@ class ChatService:
         stt: SpeechToTextPort,
         tts: TextToSpeechPort,
         chat_store: ChatStorePort,
+        audio_storage: AudioStoragePort,
     ) -> None:
         self._llm = llm
         self._stt = stt
         self._tts = tts
         self._chat_store = chat_store
+        self._audio_storage = audio_storage
 
     async def chat_text(self, message: str, session_id: Optional[str] = None) -> dict:
         session_id = session_id or str(uuid4())
@@ -65,7 +71,15 @@ class ChatService:
         }
 
     async def _synthesize_reply(self, text: str) -> Optional[str]:
-        return None
+        try:
+            audio = await self._tts.synthesize(text)
+        except Exception as exc:
+            logger.warning("TTS synthesize failed; returning text only: %s", exc)
+            return None
+        if audio is None:
+            return None
+        filename = self._audio_storage.save_wav(audio)
+        return self._audio_storage.public_url(filename)
 
     async def get_history(self, session_id: str, limit: int = 50) -> list[dict]:
         return await self._chat_store.get_messages(session_id, limit=limit)

@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "UniMate Admin",
+    "slug": "unimate-admin",
+    "version": "1.0.0",
+    "orientation": "default",
+    "platforms": ["web", "ios", "android"],
+    "userInterfaceStyle": "light",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}
