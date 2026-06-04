@@ -2,10 +2,21 @@
 #include <esp_display_panel.hpp>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <time.h>
 
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
 #include "ui_chat.h"
+#include <SPI.h>
+#include <SD.h>
+
+#if __has_include("esp32/rom/tjpgd.h")
+#include "esp32/rom/tjpgd.h"
+#elif __has_include("rom/tjpgd.h")
+#include "rom/tjpgd.h"
+#else
+#include "esp_rom_tjpgd.h"
+#endif
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -15,6 +26,10 @@ static const char *WIFI_PASSWORD = "06042004";
 static const char *SERVER_HOST = "54.206.118.226";
 static const uint16_t SERVER_PORT = 8000;
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
+static Board *global_board = nullptr;
+
+static const long GMT_OFFSET_SEC = 7 * 3600;
+static const int DAYLIGHT_OFFSET_SEC = 0;
 
 static HardwareSerial AudioSerial(1);
 static const int AUDIO_UART_RX = 44;
@@ -41,6 +56,9 @@ static char history_titles[MAX_HISTORY_SESSIONS][96];
 static const char *history_title_ptrs[MAX_HISTORY_SESSIONS];
 static uint8_t history_session_count = 0;
 static uint32_t session_counter = 0;
+static bool time_synced = false;
+static uint32_t last_time_sync_ms = 0;
+static uint32_t last_clock_update_ms = 0;
 
 static void halt_on_error(const char *message)
 {
@@ -541,6 +559,45 @@ static bool ensureWiFi()
     return false;
 }
 
+static bool syncClockFromNtp()
+{
+    if (!ensureWiFi()) {
+        return false;
+    }
+
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo, 5000)) {
+        Serial.println("NTP sync failed");
+        return false;
+    }
+
+    time_synced = true;
+    return true;
+}
+
+static void updateDashboardClock()
+{
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo, 100)) {
+        return;
+    }
+
+    char time_buf[8];
+    char date_buf[24];
+    if (strftime(time_buf, sizeof(time_buf), "%H:%M", &timeinfo) == 0) {
+        return;
+    }
+    if (strftime(date_buf, sizeof(date_buf), "%a, %b %d", &timeinfo) == 0) {
+        return;
+    }
+
+    if (lvgl_port_lock(50)) {
+        ui_chat_set_datetime(time_buf, date_buf);
+        lvgl_port_unlock();
+    }
+}
+
 static String readHttpResponse(WiFiClient &client, int *status_out)
 {
     String status_line = client.readStringUntil('\n');
@@ -806,11 +863,329 @@ static void handle_open_history()
     showHistorySessionsInUi();
 }
 
-/**
- * To use the built-in examples and demos of LVGL uncomment the includes below respectively.
- */
- // #include <demos/lv_demos.h>
- // #include <examples/lv_examples.h>
+static bool sd_initialized = false;
+static bool is_playing_video = false;
+static File video_file;
+static uint8_t *video_frame_buf = nullptr;
+static size_t video_frame_buf_sz = 128 * 1024;
+static uint32_t last_frame_time_ms = 0;
+static const uint32_t frame_interval_ms = 66; // ~15 FPS
+
+static bool init_sd_card()
+{
+    if (sd_initialized) {
+        return true;
+    }
+
+    Serial.println("Initializing SD card...");
+
+    // Initialize SPI: SCK = 12, MISO = 13, MOSI = 11, SS = 15
+    SPI.begin(12, 13, 11, 15);
+
+    // Select SD CS (EXIO4 = 4) on CH422G I/O Expander
+    if (global_board && global_board->getIO_Expander()) {
+        auto expander = static_cast<esp_expander::CH422G*>(global_board->getIO_Expander()->getBase());
+        if (expander) {
+            expander->digitalWrite(4, 0); // Pull EXIO4 LOW to select SD card
+            Serial.println("SD CS (EXIO4) set to LOW");
+        } else {
+            Serial.println("Failed to get CH422G expander base!");
+        }
+    } else {
+        Serial.println("Global board or IO expander is null!");
+    }
+
+    // Call SD.begin with dummy CS pin (15)
+    if (SD.begin(15, SPI, 4000000)) {
+        Serial.println("SD card initialized successfully.");
+        sd_initialized = true;
+        return true;
+    } else {
+        Serial.println("SD card initialization failed!");
+        return false;
+    }
+}
+
+static String find_video_file()
+{
+    if (SD.exists("/video.mjpeg")) {
+        return "/video.mjpeg";
+    }
+    if (SD.exists("/video.mjpg")) {
+        return "/video.mjpg";
+    }
+
+    File root = SD.open("/");
+    if (!root) {
+        return "";
+    }
+
+    File file = root.openNextFile();
+    while (file) {
+        if (!file.isDirectory()) {
+            String name = file.name();
+            if (name.endsWith(".mjpeg") || name.endsWith(".mjpg") || name.endsWith(".MJPEG") || name.endsWith(".MJPG")) {
+                String path = "/" + name;
+                file.close();
+                root.close();
+                return path;
+            }
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    return "";
+}
+
+struct JpgDecContext {
+    const uint8_t *data;
+    size_t size;
+    size_t index;
+    uint16_t *canvas_buf;
+    int canvas_width;
+    int canvas_height;
+};
+
+static UINT jpg_infunc(JDEC *jd, BYTE *buff, UINT nbyte)
+{
+    JpgDecContext *ctx = (JpgDecContext *)jd->device;
+    if (ctx->index + nbyte > ctx->size) {
+        nbyte = ctx->size - ctx->index;
+    }
+    if (nbyte > 0) {
+        memcpy(buff, ctx->data + ctx->index, nbyte);
+        ctx->index += nbyte;
+    }
+    return nbyte;
+}
+
+static UINT jpg_outfunc(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    JpgDecContext *ctx = (JpgDecContext *)jd->device;
+    int w = rect->right - rect->left + 1;
+    int h = rect->bottom - rect->top + 1;
+
+    int offset_x = (ctx->canvas_width - jd->width) / 2;
+    int offset_y = (ctx->canvas_height - jd->height) / 2;
+    if (offset_x < 0) offset_x = 0;
+    if (offset_y < 0) offset_y = 0;
+
+    for (int y = 0; y < h; y++) {
+        int cy = rect->top + y + offset_y;
+        if (cy >= ctx->canvas_height) break;
+
+        for (int x = 0; x < w; x++) {
+            int cx = rect->left + x + offset_x;
+            if (cx >= ctx->canvas_width) break;
+
+            uint16_t color;
+            #if JD_FORMAT == 1
+            color = ((uint16_t *)bitmap)[y * w + x];
+            #else
+            uint8_t *p = &((uint8_t *)bitmap)[(y * w + x) * 3];
+            color = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
+            #endif
+
+            ctx->canvas_buf[cy * ctx->canvas_width + cx] = color;
+        }
+    }
+    return 1;
+}
+
+static size_t find_next_soi(File &f)
+{
+    static uint8_t buffer[2048];
+    size_t pos = f.position();
+    f.seek(pos + 2); // Skip current SOI
+
+    size_t scan_pos = pos + 2;
+    while (f.available()) {
+        int bytes_read = f.read(buffer, sizeof(buffer));
+        if (bytes_read <= 0) break;
+
+        for (int i = 0; i < bytes_read - 1; i++) {
+            if (buffer[i] == 0xFF && buffer[i+1] == 0xD8) {
+                size_t found_pos = scan_pos + i;
+                f.seek(found_pos);
+                return found_pos;
+            }
+        }
+        if (buffer[bytes_read - 1] == 0xFF) {
+            int next_byte = f.peek();
+            if (next_byte == 0xD8) {
+                size_t found_pos = scan_pos + bytes_read - 1;
+                f.seek(found_pos);
+                return found_pos;
+            }
+        }
+        scan_pos += bytes_read;
+    }
+    return f.size();
+}
+
+static void play_next_video_frame()
+{
+    if (!video_file || !video_file.available()) {
+        Serial.println("Video end reached, looping...");
+        video_file.seek(0);
+    }
+
+    size_t start_pos = video_file.position();
+    size_t next_soi_pos = find_next_soi(video_file);
+    size_t frame_sz = next_soi_pos - start_pos;
+
+    if (frame_sz < 4) {
+        video_file.seek(0);
+        return;
+    }
+
+    if (frame_sz > video_frame_buf_sz) {
+        size_t new_sz = frame_sz + 16 * 1024;
+        uint8_t *new_buf = (uint8_t *)ps_realloc(video_frame_buf, new_sz);
+        if (new_buf) {
+            video_frame_buf = new_buf;
+            video_frame_buf_sz = new_sz;
+        } else {
+            Serial.println("Failed to realloc video frame buffer!");
+            return;
+        }
+    }
+
+    video_file.seek(start_pos);
+    if (video_file.read(video_frame_buf, frame_sz) != frame_sz) {
+        Serial.println("Failed to read video frame data!");
+        return;
+    }
+    video_file.seek(next_soi_pos);
+
+    JDEC jd;
+    uint8_t *pool = (uint8_t *)malloc(4096);
+    if (!pool) {
+        Serial.println("Failed to allocate JPEG pool!");
+        return;
+    }
+
+    lv_color_t *canvas_buf = ui_chat_get_video_canvas_buffer();
+    if (!canvas_buf) {
+        free(pool);
+        return;
+    }
+
+    JpgDecContext ctx;
+    ctx.data = video_frame_buf;
+    ctx.size = frame_sz;
+    ctx.index = 0;
+    ctx.canvas_buf = (uint16_t *)canvas_buf;
+    ctx.canvas_width = 800;
+    ctx.canvas_height = 480;
+
+    JRESULT res = jd_prepare(&jd, jpg_infunc, pool, 4096, &ctx);
+    if (res == JDR_OK) {
+        res = jd_decomp(&jd, jpg_outfunc, 0);
+        if (res != JDR_OK) {
+            Serial.printf("JPEG decompression failed: %d\n", res);
+        }
+    } else {
+        Serial.printf("JPEG prepare failed: %d\n", res);
+    }
+    free(pool);
+
+    if (lvgl_port_lock(50)) {
+        ui_chat_refresh_video_canvas();
+        lvgl_port_unlock();
+    }
+}
+
+static void handle_video_start()
+{
+    Serial.println("Video start request");
+
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_video_status("Dang khoi tao the nho...");
+        ui_chat_show_video_player();
+        lvgl_port_unlock();
+    }
+
+    if (!init_sd_card()) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("Loi: Khong the khoi tao the nho!\nVui long cam the nho.");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_video_status("Dang quet tim file video...");
+        lvgl_port_unlock();
+    }
+
+    String video_path = find_video_file();
+    if (video_path.length() == 0) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("Khong tim thay file video (.mjpeg)!\nVui long copy video vao the nho.");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+
+    Serial.print("Opening video file: ");
+    Serial.println(video_path);
+
+    video_file = SD.open(video_path, FILE_READ);
+    if (!video_file) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("Loi: Khong the mo file video!");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+
+    uint8_t header[2];
+    if (video_file.read(header, 2) != 2 || header[0] != 0xFF || header[1] != 0xD8) {
+        video_file.close();
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("Loi: Dinh dang video khong hop le!\nYeu cau file MJPEG (Motion JPEG).");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+    video_file.seek(0);
+
+    lv_color_t *canvas_buf = ui_chat_get_video_canvas_buffer();
+    if (canvas_buf) {
+        memset(canvas_buf, 0, 800 * 480 * sizeof(lv_color_t));
+    }
+
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_video_status("");
+        ui_chat_refresh_video_canvas();
+        lvgl_port_unlock();
+    }
+
+    if (!video_frame_buf) {
+        video_frame_buf = (uint8_t *)ps_malloc(video_frame_buf_sz);
+    }
+
+    is_playing_video = true;
+    last_frame_time_ms = millis();
+}
+
+static void handle_video_close()
+{
+    Serial.println("Video close request");
+    is_playing_video = false;
+    if (video_file) {
+        video_file.close();
+    }
+
+    if (lvgl_port_lock(200)) {
+        ui_chat_hide_video_player();
+        lvgl_port_unlock();
+    }
+}
+
+
 
 void setup()
 {
@@ -834,6 +1209,7 @@ void setup()
 
     Serial.println("Initializing board");
     Board *board = new Board();
+    global_board = board;
     if (!board->init()) {
         halt_on_error("Board init failed");
     }
@@ -881,7 +1257,12 @@ void setup()
     ui_chat_set_new_chat_callback(handle_new_chat);
     ui_chat_set_open_history_callback(handle_open_history);
     ui_chat_set_history_callback(handle_history);
+    ui_chat_set_video_callback(handle_video_start);
+    ui_chat_set_video_close_callback(handle_video_close);
     ui_chat_init();
+
+    syncClockFromNtp();
+    updateDashboardClock();
 
     // Initialize a default session id at boot; a new one will be created on each "New chat".
     if (session_id.length() == 0) {
@@ -960,6 +1341,16 @@ void loop()
         sendTextToServer(pending_text);
     }
 
+    uint32_t now = millis();
+    if (!time_synced && now - last_time_sync_ms > 30000) {
+        last_time_sync_ms = now;
+        syncClockFromNtp();
+    }
+    if (now - last_clock_update_ms > 60000) {
+        last_clock_update_ms = now;
+        updateDashboardClock();
+    }
+
     if (pending_voice_toggle) {
         pending_voice_toggle = false;
         bool should_record = ui_chat_is_mic_recording();
@@ -977,6 +1368,14 @@ void loop()
             ui_status("Uploading...");
             Serial.printf("REC_STOP sent, pcm=%u\n", (unsigned)pcm_len);
             handleChatResponse(postVoiceWav());
+        }
+    }
+
+    if (is_playing_video) {
+        uint32_t now_ms = millis();
+        if (now_ms - last_frame_time_ms >= frame_interval_ms) {
+            last_frame_time_ms = now_ms;
+            play_next_video_frame();
         }
     }
 

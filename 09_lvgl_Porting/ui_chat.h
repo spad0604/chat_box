@@ -18,7 +18,18 @@ void ui_chat_add_message(const char *role, const char *message);
 void ui_chat_clear_messages();
 void ui_chat_set_status(const char *status);
 bool ui_chat_is_mic_recording();
+void ui_chat_set_datetime(const char *time_text, const char *date_text);
 
 // Render a list of chat sessions in the chat area. Each item is clickable and will
 // call the history callback with the provided index.
 void ui_chat_show_sessions(const char *const *titles, uint8_t count);
+
+typedef void (*ui_video_cb_t)();
+void ui_chat_set_video_callback(ui_video_cb_t cb);
+void ui_chat_set_video_close_callback(ui_video_cb_t cb);
+void ui_chat_show_video_player();
+void ui_chat_hide_video_player();
+lv_color_t* ui_chat_get_video_canvas_buffer();
+void ui_chat_refresh_video_canvas();
+void ui_chat_set_video_status(const char *status);
+

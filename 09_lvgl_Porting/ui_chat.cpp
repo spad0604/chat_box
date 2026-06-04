@@ -10,6 +10,10 @@ static lv_obj_t *chat_list;
 static lv_obj_t *input_bar;
 static lv_obj_t *input_ta;
 static lv_obj_t *status_label;
+static lv_obj_t *dashboard_time_label;
+static lv_obj_t *dashboard_date_label;
+static lv_obj_t *typing_row;
+static lv_obj_t *typing_label;
 static lv_obj_t *keyboard;
 static lv_obj_t *voice_icon_box;
 static lv_obj_t *dashboard_mic_btn;
@@ -21,6 +25,17 @@ static ui_chat_simple_cb_t on_mic;
 static ui_chat_simple_cb_t on_new_chat;
 static ui_chat_simple_cb_t on_open_history;
 static ui_chat_history_cb_t on_history;
+static ui_video_cb_t on_video_start;
+static ui_video_cb_t on_video_close;
+
+static lv_obj_t *video_screen;
+static lv_obj_t *video_canvas;
+static lv_color_t *video_canvas_buf;
+static lv_obj_t *video_status_label;
+
+static void play_video_event_cb(lv_event_t *e);
+static void video_close_event_cb(lv_event_t *e);
+static void create_video_player();
 
 static lv_style_t style_screen;
 static lv_style_t style_text_dark;
@@ -31,6 +46,7 @@ static lv_style_t style_pill;
 static lv_style_t style_icon_orange;
 static lv_style_t style_icon_blue;
 static lv_style_t style_icon_green;
+static lv_style_t style_icon_red;
 static lv_style_t style_mic_recording;
 static lv_style_t style_mic_recording_ring;
 static lv_style_t style_user_bubble;
@@ -128,6 +144,12 @@ static void init_styles()
     lv_style_set_radius(&style_icon_green, 18);
     lv_style_set_text_color(&style_icon_green, lv_color_hex(0x0a8a25));
 
+    lv_style_init(&style_icon_red);
+    lv_style_set_bg_color(&style_icon_red, lv_color_hex(0xffd5d5));
+    lv_style_set_bg_opa(&style_icon_red, LV_OPA_COVER);
+    lv_style_set_radius(&style_icon_red, 18);
+    lv_style_set_text_color(&style_icon_red, lv_color_hex(0xe53935));
+
     lv_style_init(&style_mic_recording);
     lv_style_set_bg_color(&style_mic_recording, lv_color_hex(0x0aa7cf));
     lv_style_set_bg_opa(&style_mic_recording, LV_OPA_COVER);
@@ -218,6 +240,8 @@ static lv_obj_t *make_label(lv_obj_t *parent, const char *text, lv_style_t *styl
     return label;
 }
 
+static lv_obj_t *create_message_row(const char *role);
+
 static void scroll_chat_to_bottom(lv_anim_enable_t anim)
 {
     if (!chat_list) {
@@ -233,6 +257,46 @@ static void scroll_chat_to_bottom(lv_anim_enable_t anim)
     if (last_child) {
         lv_obj_scroll_to_view(last_child, anim);
     }
+}
+
+static void set_typing_indicator(bool show, const char *text)
+{
+    if (!typing_row || !chat_list) {
+        return;
+    }
+
+    if (show) {
+        if (typing_label && text) {
+            lv_label_set_text(typing_label, text);
+        }
+        uint32_t count = lv_obj_get_child_cnt(chat_list);
+        lv_obj_move_to_index(typing_row, count == 0 ? 0 : count - 1);
+        lv_obj_clear_flag(typing_row, LV_OBJ_FLAG_HIDDEN);
+        scroll_chat_to_bottom(LV_ANIM_OFF);
+    } else {
+        lv_obj_add_flag(typing_row, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void create_typing_indicator()
+{
+    typing_row = create_message_row("assistant");
+    typing_label = NULL;
+    if (!typing_row) {
+        return;
+    }
+
+    lv_obj_t *bubble = plain_obj(typing_row);
+    lv_obj_add_style(bubble, &style_bot_bubble, 0);
+    lv_obj_set_width(bubble, LV_PCT(28));
+    lv_obj_set_height(bubble, LV_SIZE_CONTENT);
+
+    typing_label = lv_label_create(bubble);
+    lv_label_set_text(typing_label, "Thinking...");
+    lv_label_set_long_mode(typing_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(typing_label, LV_PCT(100));
+    lv_obj_set_style_text_font(typing_label, &font_vietnamese_16, 0);
+    lv_obj_add_flag(typing_row, LV_OBJ_FLAG_HIDDEN);
 }
 
 static lv_obj_t *make_circle(lv_obj_t *parent, int16_t size, lv_color_t color, lv_opa_t opa)
@@ -606,11 +670,21 @@ static void create_dashboard()
     lv_label_set_text(school_label, "FPT University");
     lv_obj_center(school_label);
 
-    lv_obj_t *time_label = make_label(dashboard_screen, "21:49", &style_text_dark);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_14, 0);
-    lv_obj_align(time_label, LV_ALIGN_TOP_RIGHT, -sx(155), sy(28));
-    lv_obj_t *date_label = make_label(dashboard_screen, "Mon, May 25", &style_text_muted);
-    lv_obj_align_to(date_label, time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
+    lv_obj_t *time_box = plain_obj(dashboard_screen);
+    lv_obj_set_size(time_box, sx(180), sy(48));
+    lv_obj_align(time_box, LV_ALIGN_TOP_MID, 0, sy(22));
+    lv_obj_set_flex_flow(time_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(time_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(time_box, LV_OPA_TRANSP, 0);
+
+    dashboard_time_label = make_label(time_box, "--:--", &style_text_dark);
+    lv_obj_set_style_text_font(dashboard_time_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(dashboard_time_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(dashboard_time_label, LV_PCT(100));
+
+    dashboard_date_label = make_label(time_box, "--", &style_text_muted);
+    lv_obj_set_style_text_align(dashboard_date_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(dashboard_date_label, LV_PCT(100));
 
     lv_obj_t *bell = lv_btn_create(dashboard_screen);
     lv_obj_remove_style_all(bell);
@@ -621,6 +695,8 @@ static void create_dashboard()
     lv_obj_t *bell_label = lv_label_create(bell);
     lv_label_set_text(bell_label, LV_SYMBOL_LOOP);
     lv_obj_center(bell_label);
+
+    (void)time_box;
 
     lv_obj_t *badge = make_circle(bell, at_least(sx(19), 17), lv_color_hex(0xff6b13), LV_OPA_COVER);
     lv_obj_align(badge, LV_ALIGN_TOP_RIGHT, 1, -4);
@@ -639,7 +715,7 @@ static void create_dashboard()
     lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, sy(334));
 
     lv_obj_t *cards = plain_obj(dashboard_screen);
-    lv_obj_set_size(cards, LV_PCT(70), sy(130));
+    lv_obj_set_size(cards, LV_PCT(92), sy(130));
     lv_obj_align(cards, LV_ALIGN_TOP_MID, 0, sy(376));
     lv_obj_set_flex_flow(cards, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(cards, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -647,6 +723,7 @@ static void create_dashboard()
     make_action_card(cards, "AI Chat", "AI", &style_icon_orange, new_chat_event_cb, NULL);
     make_action_card(cards, "Voice Assistant", NULL, &style_icon_blue, mic_event_cb, NULL);
     make_action_card(cards, "Campus News", LV_SYMBOL_FILE, &style_icon_green, campus_news_event_cb, NULL);
+    make_action_card(cards, "Play Video", LV_SYMBOL_VIDEO, &style_icon_red, play_video_event_cb, NULL);
 
     dashboard_mic_ring = make_circle(dashboard_screen, at_least(sx(96), 68), lv_color_hex(0xffd9bd), LV_OPA_60);
     lv_obj_align(dashboard_mic_ring, LV_ALIGN_BOTTOM_MID, 0, -sy(22));
@@ -713,6 +790,8 @@ static void create_chat()
     lv_obj_set_scrollbar_mode(chat_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(chat_list, LV_DIR_VER);
 
+    create_typing_indicator();
+
     input_bar = plain_obj(chat_screen);
     lv_obj_set_size(input_bar, LV_PCT(100), sy(78));
     lv_obj_align(input_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -761,6 +840,7 @@ void ui_chat_init()
     init_styles();
     create_dashboard();
     create_chat();
+    create_video_player();
 
     ui_chat_add_message("assistant", "Hi! I'm UniMate. How can I help you today?");
 
@@ -799,6 +879,8 @@ void ui_chat_show_sessions(const char *const *titles, uint8_t count)
     }
 
     lv_obj_clean(chat_list);
+    typing_row = NULL;
+    typing_label = NULL;
 
     if (!titles || count == 0) {
         ui_chat_add_message("assistant", "No chat sessions yet.");
@@ -831,6 +913,8 @@ void ui_chat_add_message(const char *role, const char *message)
         return;
     }
 
+    set_typing_indicator(false, NULL);
+
     lv_obj_t *row = create_message_row(role);
     lv_obj_t *bubble = plain_obj(row);
     lv_obj_add_style(bubble, strcmp(role, "user") == 0 ? &style_user_bubble : &style_bot_bubble, 0);
@@ -851,16 +935,143 @@ void ui_chat_clear_messages()
     if (chat_list) {
         lv_obj_clean(chat_list);
     }
+    typing_row = NULL;
+    typing_label = NULL;
+
+    if (chat_list) {
+        create_typing_indicator();
+    }
 }
 
 void ui_chat_set_status(const char *status)
 {
-    if (status_label && status) {
-        lv_label_set_text(status_label, status);
+    if (!status_label || !status) {
+        return;
+    }
+
+    if (strcmp(status, "Thinking...") == 0) {
+        lv_label_set_text(status_label, "Online");
+        set_typing_indicator(true, status);
+        return;
+    }
+
+    set_typing_indicator(false, NULL);
+    lv_label_set_text(status_label, status);
+}
+
+void ui_chat_set_datetime(const char *time_text, const char *date_text)
+{
+    if (dashboard_time_label && time_text) {
+        lv_label_set_text(dashboard_time_label, time_text);
+    }
+    if (dashboard_date_label && date_text) {
+        lv_label_set_text(dashboard_date_label, date_text);
     }
 }
 
 bool ui_chat_is_mic_recording()
 {
     return mic_is_recording;
+}
+
+static void create_video_player()
+{
+    video_screen = lv_obj_create(NULL);
+    lv_obj_remove_style_all(video_screen);
+    lv_obj_add_style(video_screen, &style_screen, 0);
+    lv_obj_set_size(video_screen, LV_PCT(100), LV_PCT(100));
+    lv_obj_clear_flag(video_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(video_screen, LV_SCROLLBAR_MODE_OFF);
+
+    // Allocate canvas buffer in PSRAM
+    video_canvas_buf = (lv_color_t *)ps_malloc(800 * 480 * sizeof(lv_color_t));
+    if (video_canvas_buf) {
+        memset(video_canvas_buf, 0, 800 * 480 * sizeof(lv_color_t));
+    }
+
+    // Create canvas
+    video_canvas = lv_canvas_create(video_screen);
+    lv_canvas_set_buffer(video_canvas, video_canvas_buf, 800, 480, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_align(video_canvas, LV_ALIGN_CENTER, 0, 0);
+
+    // Error status label in center
+    video_status_label = lv_label_create(video_screen);
+    lv_obj_add_style(video_status_label, &style_text_dark, 0);
+    lv_obj_set_style_text_font(video_status_label, &font_vietnamese_16, 0);
+    lv_label_set_text(video_status_label, "");
+    lv_obj_align(video_status_label, LV_ALIGN_CENTER, 0, 0);
+
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(video_screen);
+    lv_obj_remove_style_all(close_btn);
+    lv_obj_add_style(close_btn, &style_close_button, 0);
+    lv_obj_set_size(close_btn, at_least(sx(48), 44), at_least(sx(48), 44));
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -sx(20), sy(20));
+    lv_obj_add_event_cb(close_btn, video_close_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_label);
+}
+
+void ui_chat_set_video_callback(ui_video_cb_t cb)
+{
+    on_video_start = cb;
+}
+
+void ui_chat_set_video_close_callback(ui_video_cb_t cb)
+{
+    on_video_close = cb;
+}
+
+void ui_chat_show_video_player()
+{
+    if (video_screen) {
+        lv_scr_load_anim(video_screen, LV_SCR_LOAD_ANIM_FADE_ON, 140, 0, false);
+    }
+}
+
+void ui_chat_hide_video_player()
+{
+    show_dashboard_screen();
+}
+
+lv_color_t* ui_chat_get_video_canvas_buffer()
+{
+    return video_canvas_buf;
+}
+
+void ui_chat_refresh_video_canvas()
+{
+    if (video_canvas) {
+        lv_obj_invalidate(video_canvas);
+    }
+}
+
+void ui_chat_set_video_status(const char *status)
+{
+    if (video_status_label) {
+        if (status && strlen(status) > 0) {
+            lv_label_set_text(video_status_label, status);
+            lv_obj_clear_flag(video_status_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(video_status_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void play_video_event_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    if (on_video_start) {
+        on_video_start();
+    }
+}
+
+static void video_close_event_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    if (on_video_close) {
+        on_video_close();
+    }
 }
