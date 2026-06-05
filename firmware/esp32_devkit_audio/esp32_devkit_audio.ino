@@ -1,10 +1,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <driver/i2s.h>
+#include <Preferences.h>
 
 // ===================== USER CONFIG =====================
-static const char *WIFI_SSID = "spad0604";
-static const char *WIFI_PASSWORD = "06042004";
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
 
 // HMI UART
@@ -396,16 +395,22 @@ static void writeSilenceMs(uint32_t ms) {
 static void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  String ssid = prefs.getString("ssid", "spad0604");
+  String pass = prefs.getString("pass", "06042004");
+  prefs.end();
+
   Serial.print("Connecting WiFi: ");
-  Serial.println(WIFI_SSID);
+  Serial.println(ssid);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(ssid.c_str(), pass.c_str());
 
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(250);
     Serial.print(".");
   }
@@ -684,6 +689,7 @@ static bool isKnownCommandPrefix(const String &line) {
          line == "REC_START" ||
          line == "REC_STOP" ||
          line == "MIC_TEST" ||
+         line.startsWith("WIFI_CREDS ") ||
          line.startsWith("PLAY_URL ");
 }
 
@@ -700,6 +706,21 @@ static void handleCommand(String line) {
     printMicLevelOnce();
   } else if (line.startsWith("PLAY_URL ")) {
     playUrl(line.substring(9));
+  } else if (line.startsWith("WIFI_CREDS ")) {
+    String payload = line.substring(11);
+    int spaceIdx = payload.indexOf(' ');
+    if (spaceIdx > 0) {
+      String ssid = payload.substring(0, spaceIdx);
+      String pass = payload.substring(spaceIdx + 1);
+      Preferences prefs;
+      prefs.begin("wifi", false);
+      prefs.putString("ssid", ssid);
+      prefs.putString("pass", pass);
+      prefs.end();
+      Serial.println("Saved new WiFi credentials. Reconnecting...");
+      WiFi.disconnect();
+      connectWiFi();
+    }
   } else if (line.length() > 0) {
     Serial.print("Unknown command: ");
     Serial.println(line);

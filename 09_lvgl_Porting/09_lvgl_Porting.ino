@@ -1,7 +1,9 @@
 #include <Arduino.h>
+#include "esp_task_wdt.h"
 #include <esp_display_panel.hpp>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 
 #include <lvgl.h>
@@ -21,8 +23,14 @@
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
 
-static const char *WIFI_SSID = "spad0604";
-static const char *WIFI_PASSWORD = "06042004";
+#include <Preferences.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+static WebServer *captive_server = nullptr;
+static DNSServer *dns_server = nullptr;
+static bool in_ap_mode = false;
+static const char *DEFAULT_WIFI_SSID = "spad0604";
+static const char *DEFAULT_WIFI_PASSWORD = "06042004";
 static const char *SERVER_HOST = "54.206.118.226";
 static const uint16_t SERVER_PORT = 8000;
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
@@ -35,6 +43,10 @@ static HardwareSerial AudioSerial(1);
 static const int AUDIO_UART_RX = 44;
 static const int AUDIO_UART_TX = 43;
 static const uint32_t AUDIO_UART_BAUD = 460800;
+
+static bool ensureWiFi();
+static void playAudioUrl(const String &audio_url);
+static String readHttpResponse(WiFiClient &client, int *status_out);
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
@@ -220,9 +232,8 @@ static String httpGet(const String &path)
     int status = 0;
     String body = readHttpResponse(client, &status);
     client.stop();
-
-    Serial.printf("GET %s -> %d\n", path.c_str(), status);
     if (status < 200 || status >= 300) {
+        Serial.printf("HTTP GET %s failed: %d\n", path.c_str(), status);
         return "";
     }
     return body;
@@ -542,20 +553,91 @@ static bool ensureWiFi()
     if (WiFi.status() == WL_CONNECTED) {
         return true;
     }
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-        delay(250);
-        Serial.print(".");
+    if (in_ap_mode) {
+        return false;
     }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("WiFi IP: ");
-        Serial.println(WiFi.localIP());
-        return true;
+
+    Preferences prefs;
+    prefs.begin("wifi", true);
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+
+    if (ssid.length() == 0 && strlen(DEFAULT_WIFI_SSID) > 0) {
+        ssid = DEFAULT_WIFI_SSID;
+        pass = DEFAULT_WIFI_PASSWORD;
+        Serial.println("No saved WiFi. Using default WiFi credentials from sketch.");
     }
-    Serial.println("WiFi connect failed");
+
+    if (ssid.length() > 0) {
+        Serial.print("Connecting to WiFi: ");
+        Serial.println(ssid);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        uint32_t start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+            delay(250);
+            Serial.print(".");
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.print("WiFi IP: ");
+            Serial.println(WiFi.localIP());
+            return true;
+        }
+        Serial.println("WiFi connect failed. Starting AP.");
+    }
+
+    in_ap_mode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("UniMate-AP");
+
+    dns_server = new DNSServer();
+    dns_server->start(53, "*", WiFi.softAPIP());
+
+    captive_server = new WebServer(80);
+    captive_server->on("/", HTTP_GET, []() {
+        String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head>"
+                      "<body style='font-family:sans-serif; padding:20px;'>"
+                      "<h2>Wifi Config</h2>"
+                      "<form action='/save' method='POST'>"
+                      "SSID:<br><input type='text' name='ssid' style='width:100%; padding:10px; margin:5px 0 15px;'><br>"
+                      "Password:<br><input type='password' name='pass' style='width:100%; padding:10px; margin:5px 0 15px;'><br>"
+                      "<input type='submit' value='Save' style='width:100%; padding:10px; background:#ff7417; color:#fff; border:none; border-radius:18px;'>"
+                      "</form></body></html>";
+        captive_server->send(200, "text/html", html);
+    });
+
+    captive_server->on("/save", HTTP_POST, []() {
+        String nssid = captive_server->arg("ssid");
+        String npass = captive_server->arg("pass");
+
+        Preferences p;
+        p.begin("wifi", false);
+        p.putString("ssid", nssid);
+        p.putString("pass", npass);
+        p.end();
+
+        String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head>"
+                      "<body style='font-family:sans-serif; padding:20px;'><h2>Saved. Rebooting...</h2></body></html>";
+        captive_server->send(200, "text/html", html);
+
+        AudioSerial.printf("WIFI_CREDS %s %s\n", nssid.c_str(), npass.c_str());
+        Serial.printf("[HMI UART TX] WIFI_CREDS %s %s\n", nssid.c_str(), npass.c_str());
+
+        delay(1000);
+        ESP.restart();
+    });
+
+    captive_server->onNotFound([]() {
+        captive_server->sendHeader("Location", "http://192.168.4.1/", true);
+        captive_server->send(302, "text/plain", "");
+    });
+
+    captive_server->begin();
+    ui_status("AP: UniMate-AP");
+    Serial.println("AP started. Connect to 'UniMate-AP' and go to http://192.168.4.1");
+
     return false;
 }
 
@@ -806,22 +888,13 @@ static void handle_new_chat()
     Serial.println(session_id);
 }
 
-static void handle_history(uint8_t index)
+static volatile bool pending_history_load = false;
+static uint8_t pending_history_idx = 0;
+
+static void loadHistoryData(uint8_t index)
 {
-    Serial.print("Open history index: ");
-    Serial.println(index);
-
-    if (index >= history_session_count) {
-        return;
-    }
-
     String selected_session = history_session_ids[index];
-    if (selected_session.length() == 0) {
-        return;
-    }
-
     session_id = selected_session;
-    ui_status("Loading...");
 
     String path = "/api/v1/chat/history/" + selected_session + "?limit=50";
     String body = httpGet(path);
@@ -857,53 +930,141 @@ static void handle_history(uint8_t index)
     ui_status("History");
 }
 
+static void handle_history(uint8_t index)
+{
+    Serial.print("Open history index: ");
+    Serial.println(index);
+
+    if (index >= history_session_count) {
+        return;
+    }
+
+    String selected_session = history_session_ids[index];
+    if (selected_session.length() == 0) {
+        return;
+    }
+
+    ui_chat_clear_messages();
+    ui_chat_add_message("assistant", "Loading...");
+
+    pending_history_idx = index;
+    pending_history_load = true;
+}
+
+static volatile bool pending_open_history = false;
+
 static void handle_open_history()
 {
-    Serial.println("Open history");
-    showHistorySessionsInUi();
+    Serial.println("Open history requested");
+    pending_open_history = true;
 }
 
 static bool sd_initialized = false;
 static bool is_playing_video = false;
+static volatile bool video_task_stop = false;
+static TaskHandle_t video_task_handle = nullptr;
 static File video_file;
 static uint8_t *video_frame_buf = nullptr;
 static size_t video_frame_buf_sz = 128 * 1024;
 static uint32_t last_frame_time_ms = 0;
-static const uint32_t frame_interval_ms = 66; // ~15 FPS
+static const uint32_t frame_interval_ms = 200; // Stability first: ~5 FPS while decoding on CPU
+static const size_t video_frame_max_sz = 384 * 1024;
 
 static bool init_sd_card()
 {
+    constexpr int SD_CS_EXIO = 4;
+    constexpr int SD_DUMMY_CS = 6;
+    constexpr int SD_CLK = 12;
+    constexpr int SD_MISO = 13;
+    constexpr int SD_MOSI = 11;
+
     if (sd_initialized) {
         return true;
     }
 
     Serial.println("Initializing SD card...");
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_video_status("SD: Initializing SPI...");
+        lvgl_port_unlock();
+    }
 
-    // Initialize SPI: SCK = 12, MISO = 13, MOSI = 11, SS = 15
-    SPI.begin(12, 13, 11, 15);
+    SPI.setHwCs(false);
+    pinMode(SD_MISO, INPUT_PULLUP);
+    pinMode(SD_MOSI, INPUT_PULLUP);
+    pinMode(SD_CLK, INPUT_PULLUP);
+    pinMode(SD_DUMMY_CS, OUTPUT);
+    digitalWrite(SD_DUMMY_CS, HIGH);
+    SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_DUMMY_CS);
 
     // Select SD CS (EXIO4 = 4) on CH422G I/O Expander
+    esp_task_wdt_reset();
     if (global_board && global_board->getIO_Expander()) {
         auto expander = static_cast<esp_expander::CH422G*>(global_board->getIO_Expander()->getBase());
         if (expander) {
-            expander->digitalWrite(4, 0); // Pull EXIO4 LOW to select SD card
+            expander->enableAllIO_Output();
+            expander->pinMode(SD_CS_EXIO, OUTPUT);
+            expander->digitalWrite(SD_CS_EXIO, 1);
+            delay(5);
+            for (int i = 0; i < 16; i++) {
+                SPI.transfer(0xFF);
+            }
+            expander->digitalWrite(SD_CS_EXIO, 0); // Pull EXIO4 LOW to select SD card
             Serial.println("SD CS (EXIO4) set to LOW");
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_video_status("SD: EXIO4 reset OK\nSD.begin()...");
+                lvgl_port_unlock();
+            }
         } else {
             Serial.println("Failed to get CH422G expander base!");
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_video_status("SD ERR: CH422G expander NULL!\nKhong lay duoc IO Expander");
+                lvgl_port_unlock();
+            }
         }
     } else {
         Serial.println("Global board or IO expander is null!");
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("SD ERR: global_board or\nIO expander is NULL!");
+            lvgl_port_unlock();
+        }
     }
 
-    // Call SD.begin with dummy CS pin (15)
-    if (SD.begin(15, SPI, 4000000)) {
-        Serial.println("SD card initialized successfully.");
-        sd_initialized = true;
-        return true;
-    } else {
-        Serial.println("SD card initialization failed!");
-        return false;
+    // Try multiple SPI speeds
+    esp_task_wdt_reset();
+    uint32_t speeds[] = {4000000, 2000000, 1000000, 400000};
+    for (int i = 0; i < 4; i++) {
+        esp_task_wdt_reset();
+        if (lvgl_port_lock(200)) {
+            String msg = "SD.begin(CS=15, " + String(speeds[i]/1000) + "kHz)...";
+            ui_chat_set_video_status(msg.c_str());
+            lvgl_port_unlock();
+        }
+        if (SD.begin(15, SPI, speeds[i])) {
+            Serial.printf("SD card OK at %d Hz\n", speeds[i]);
+            sd_initialized = true;
+            uint8_t card_type = SD.cardType();
+            if (card_type == CARD_NONE) {
+                Serial.printf("SD mounted at %d Hz but card type is NONE\n", speeds[i]);
+                continue;
+            }
+            Serial.printf("SD card OK at %d Hz\n", speeds[i]);
+            Serial.printf("SD card type: %u, size: %llu MB\n", card_type, SD.cardSize() / (1024 * 1024));
+            sd_initialized = true;
+            if (lvgl_port_lock(200)) {
+                String msg = "SD OK! Speed: " + String(speeds[i]/1000) + "kHz";
+                ui_chat_set_video_status(msg.c_str());
+                lvgl_port_unlock();
+            }
+            return true;
+        }
+        Serial.printf("SD.begin failed at %d Hz\n", speeds[i]);
     }
+
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_video_status("SD FAILED tat ca toc do!\n- Kiem tra the nho FAT32\n- Cam lai the cho chat\n- Thu the nho khac");
+        lvgl_port_unlock();
+    }
+    return false;
 }
 
 static String find_video_file()
@@ -940,18 +1101,48 @@ static String find_video_file()
 
 struct JpgDecContext {
     const uint8_t *data;
+    File *file;
     size_t size;
     size_t index;
     uint16_t *canvas_buf;
     int canvas_width;
     int canvas_height;
+    uint32_t blocks;
+    uint8_t scale;
 };
 
 static UINT jpg_infunc(JDEC *jd, BYTE *buff, UINT nbyte)
 {
     JpgDecContext *ctx = (JpgDecContext *)jd->device;
+    if (!ctx) {
+        return 0;
+    }
+
+    if (ctx->file) {
+        if (ctx->index + nbyte > ctx->size) {
+            nbyte = ctx->size - ctx->index;
+        }
+        if (nbyte == 0) {
+            return 0;
+        }
+        if (!buff) {
+            ctx->file->seek(ctx->file->position() + nbyte);
+            ctx->index += nbyte;
+            return nbyte;
+        }
+        int read_len = ctx->file->read(buff, nbyte);
+        if (read_len > 0) {
+            ctx->index += read_len;
+        }
+        return read_len > 0 ? read_len : 0;
+    }
+
     if (ctx->index + nbyte > ctx->size) {
         nbyte = ctx->size - ctx->index;
+    }
+    if (!buff) {
+        ctx->index += nbyte;
+        return nbyte;
     }
     if (nbyte > 0) {
         memcpy(buff, ctx->data + ctx->index, nbyte);
@@ -963,13 +1154,26 @@ static UINT jpg_infunc(JDEC *jd, BYTE *buff, UINT nbyte)
 static UINT jpg_outfunc(JDEC *jd, void *bitmap, JRECT *rect)
 {
     JpgDecContext *ctx = (JpgDecContext *)jd->device;
+    if (!ctx || !ctx->canvas_buf || !bitmap) {
+        return 0;
+    }
+
     int w = rect->right - rect->left + 1;
     int h = rect->bottom - rect->top + 1;
 
-    int offset_x = (ctx->canvas_width - jd->width) / 2;
-    int offset_y = (ctx->canvas_height - jd->height) / 2;
+    int decoded_width = jd->width >> ctx->scale;
+    int decoded_height = jd->height >> ctx->scale;
+    if (decoded_width <= 0) decoded_width = jd->width;
+    if (decoded_height <= 0) decoded_height = jd->height;
+
+    int offset_x = (ctx->canvas_width - decoded_width) / 2;
+    int offset_y = (ctx->canvas_height - decoded_height) / 2;
     if (offset_x < 0) offset_x = 0;
     if (offset_y < 0) offset_y = 0;
+
+    if (rect->left >= ctx->canvas_width || rect->top >= ctx->canvas_height) {
+        return 1;
+    }
 
     for (int y = 0; y < h; y++) {
         int cy = rect->top + y + offset_y;
@@ -989,6 +1193,12 @@ static UINT jpg_outfunc(JDEC *jd, void *bitmap, JRECT *rect)
 
             ctx->canvas_buf[cy * ctx->canvas_width + cx] = color;
         }
+    }
+
+    ctx->blocks++;
+    if ((ctx->blocks & 0x0F) == 0) {
+        esp_task_wdt_reset();
+        vTaskDelay(1);
     }
     return 1;
 }
@@ -1026,6 +1236,10 @@ static size_t find_next_soi(File &f)
 
 static void play_next_video_frame()
 {
+    if (video_task_stop) {
+        return;
+    }
+
     if (!video_file || !video_file.available()) {
         Serial.println("Video end reached, looping...");
         video_file.seek(0);
@@ -1037,6 +1251,12 @@ static void play_next_video_frame()
 
     if (frame_sz < 4) {
         video_file.seek(0);
+        return;
+    }
+
+    if (frame_sz > video_frame_max_sz) {
+        Serial.printf("Skip oversized MJPEG frame: %u bytes\n", (unsigned)frame_sz);
+        video_file.seek(next_soi_pos);
         return;
     }
 
@@ -1059,8 +1279,15 @@ static void play_next_video_frame()
     }
     video_file.seek(next_soi_pos);
 
+    if (video_task_stop) {
+        return;
+    }
+
     JDEC jd;
-    uint8_t *pool = (uint8_t *)malloc(4096);
+    static uint8_t *pool = nullptr;
+    if (!pool) {
+        pool = (uint8_t *)malloc(4096);
+    }
     if (!pool) {
         Serial.println("Failed to allocate JPEG pool!");
         return;
@@ -1068,43 +1295,669 @@ static void play_next_video_frame()
 
     lv_color_t *canvas_buf = ui_chat_get_video_canvas_buffer();
     if (!canvas_buf) {
-        free(pool);
+        Serial.println("Video canvas buffer is NULL");
+        return;
+    }
+
+    if (!lvgl_port_lock(200)) {
+        Serial.println("Skip video frame: LVGL lock timeout");
         return;
     }
 
     JpgDecContext ctx;
     ctx.data = video_frame_buf;
+    ctx.file = nullptr;
     ctx.size = frame_sz;
     ctx.index = 0;
     ctx.canvas_buf = (uint16_t *)canvas_buf;
     ctx.canvas_width = 800;
     ctx.canvas_height = 480;
+    ctx.blocks = 0;
+    ctx.scale = 2;
 
+    memset(canvas_buf, 0, 800 * 480 * sizeof(lv_color_t));
+    esp_task_wdt_reset();
+    Serial.printf("Video JPEG prepare: frame=%u scale=%u\n", (unsigned)frame_sz, ctx.scale);
     JRESULT res = jd_prepare(&jd, jpg_infunc, pool, 4096, &ctx);
     if (res == JDR_OK) {
-        res = jd_decomp(&jd, jpg_outfunc, 0);
+        Serial.printf("Video JPEG decode start: %ux%u\n", jd.width, jd.height);
+        res = jd_decomp(&jd, jpg_outfunc, ctx.scale);
+        Serial.printf("Video JPEG decode result: %d, blocks=%u\n", res, (unsigned)ctx.blocks);
         if (res != JDR_OK) {
             Serial.printf("JPEG decompression failed: %d\n", res);
         }
     } else {
         Serial.printf("JPEG prepare failed: %d\n", res);
     }
-    free(pool);
 
-    if (lvgl_port_lock(50)) {
-        ui_chat_refresh_video_canvas();
-        lvgl_port_unlock();
-    }
+    ui_chat_refresh_video_canvas();
+    lvgl_port_unlock();
 }
 
-static void handle_video_start()
+static void video_player_task(void *arg)
 {
-    Serial.println("Video start request");
+    (void)arg;
+    Serial.println("Video task started");
+    uint32_t last_frame = millis();
+
+    while (!video_task_stop) {
+        uint32_t now = millis();
+        if (now - last_frame >= frame_interval_ms) {
+            last_frame = now;
+            play_next_video_frame();
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    if (video_file) {
+        video_file.close();
+    }
+    is_playing_video = false;
+    video_task_handle = nullptr;
+    Serial.println("Video task stopped");
+    vTaskDelete(nullptr);
+}
+
+static volatile bool pending_campus_news = false;
+static bool is_campus_news_active = false;
+static uint32_t last_banner_change_ms = 0;
+static uint8_t current_campus_image_idx = 0;
+static constexpr uint8_t MAX_CAMPUS_IMAGES = 20;
+static constexpr size_t NEWS_JPEG_MAX = 512 * 1024;
+static constexpr size_t LOCAL_JPEG_MAX = 8 * 1024 * 1024;
+static String campus_image_paths[MAX_CAMPUS_IMAGES];
+static uint8_t campus_image_count = 0;
+static uint8_t *news_jpeg_buf = nullptr;
+
+static bool draw_test_banner()
+{
+    lv_color_t *canvas_buf = ui_chat_get_news_canvas_buffer();
+    if (!canvas_buf) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("ERR: canvas_buf NULL");
+            lvgl_port_unlock();
+        }
+        return false;
+    }
+
+    for (int y = 0; y < 480; y++) {
+        for (int x = 0; x < 800; x++) {
+            uint8_t r = 18 + (x * 70 / 799);
+            uint8_t g = 58 + (y * 120 / 479);
+            uint8_t b = 120 + ((x + y) * 70 / 1279);
+            if (x > 72 && x < 728 && y > 86 && y < 394) {
+                r = (r > 221) ? 255 : r + 34;
+                g = (g > 225) ? 255 : g + 30;
+                b = (b > 239) ? 255 : b + 16;
+            }
+            if (((x / 24) + (y / 24)) % 9 == 0) {
+                r = (r > 231) ? 255 : r + 24;
+                g = (g > 239) ? 255 : g + 16;
+            }
+            canvas_buf[y * 800 + x] = lv_color_make(r, g, b);
+        }
+    }
 
     if (lvgl_port_lock(200)) {
-        ui_chat_set_video_status("Dang khoi tao the nho...");
-        ui_chat_show_video_player();
+        ui_chat_set_campus_news_status("TEST IMAGE: local canvas\nNo server/network needed");
+        ui_chat_refresh_news_canvas();
         lvgl_port_unlock();
+    }
+    return true;
+}
+
+static bool download_image(const String& url) {
+    if (url.startsWith("test://")) {
+        return draw_test_banner();
+    }
+
+    if (lvgl_port_lock(200)) {
+        String msg = "URL: " + url.substring(0, 50) + "\nConnecting...";
+        ui_chat_set_campus_news_status(msg.c_str());
+        lvgl_port_unlock();
+    }
+    
+    // Parse URL: support plain HTTP and HTTPS test images.
+    String host;
+    String path;
+    int port = 80;
+    bool is_https = false;
+    
+    if (url.startsWith("http://")) {
+        String rest = url.substring(7);
+        int slash = rest.indexOf('/');
+        if (slash < 0) { host = rest; path = "/"; }
+        else { host = rest.substring(0, slash); path = rest.substring(slash); }
+        int colon = host.indexOf(':');
+        if (colon >= 0) {
+            port = host.substring(colon + 1).toInt();
+            host = host.substring(0, colon);
+        }
+    } else if (url.startsWith("https://")) {
+        is_https = true;
+        port = 443;
+        String rest = url.substring(8);
+        int slash = rest.indexOf('/');
+        if (slash < 0) { host = rest; path = "/"; }
+        else { host = rest.substring(0, slash); path = rest.substring(slash); }
+        int colon = host.indexOf(':');
+        if (colon >= 0) {
+            port = host.substring(colon + 1).toInt();
+            host = host.substring(0, colon);
+        }
+    } else {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("ERR: URL must be http/https");
+            lvgl_port_unlock();
+        }
+        return false;
+    }
+    
+    WiFiClient *plain_client = nullptr;
+    WiFiClientSecure *secure_client = nullptr;
+    Client *client = nullptr;
+    if (is_https) {
+        secure_client = new WiFiClientSecure();
+        if (!secure_client) {
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_campus_news_status("ERR: WiFiClientSecure alloc");
+                lvgl_port_unlock();
+            }
+            return false;
+        }
+        secure_client->setInsecure();
+        secure_client->setTimeout(10);
+        client = secure_client;
+    } else {
+        plain_client = new WiFiClient();
+        if (!plain_client) {
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_campus_news_status("ERR: WiFiClient alloc");
+                lvgl_port_unlock();
+            }
+            return false;
+        }
+        plain_client->setTimeout(10);
+        client = plain_client;
+    }
+
+    auto close_client = [&]() {
+        if (client) {
+            client->stop();
+        }
+        delete plain_client;
+        delete secure_client;
+        plain_client = nullptr;
+        secure_client = nullptr;
+        client = nullptr;
+    };
+
+    if (!client->connect(host.c_str(), port)) {
+        if (lvgl_port_lock(200)) {
+            String msg = "ERR: Connect failed\nHost: " + host + ":" + String(port);
+            ui_chat_set_campus_news_status(msg.c_str());
+            lvgl_port_unlock();
+        }
+        close_client();
+        return false;
+    }
+    
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_campus_news_status("Connected!\nSending GET...");
+        lvgl_port_unlock();
+    }
+    
+    client->printf(
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: UniMate-ESP32S3/1.0\r\n"
+        "Accept: image/jpeg,image/*,*/*\r\n"
+        "Connection: close\r\n\r\n",
+        path.c_str(),
+        host.c_str()
+    );
+    
+    // Read HTTP headers
+    int http_code = 0;
+    String redirect_url = "";
+    String content_type = "";
+    int content_length = -1;
+    bool transfer_chunked = false;
+    uint32_t t0 = millis();
+    while (!client->available() && client->connected() && (millis() - t0 < 10000)) {
+        delay(10);
+    }
+    while ((client->connected() || client->available()) && (millis() - t0 < 10000)) {
+        String line = client->readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) break;
+        Serial.print("[Campus image HTTP] ");
+        Serial.println(line);
+        if (http_code == 0 && line.startsWith("HTTP/")) {
+            int sp1 = line.indexOf(' ');
+            if (sp1 > 0) http_code = line.substring(sp1 + 1, sp1 + 4).toInt();
+        }
+        if (line.startsWith("Location: ") || line.startsWith("location: ")) {
+            redirect_url = line.substring(10);
+            redirect_url.trim();
+        }
+        if (line.startsWith("Content-Type: ") || line.startsWith("content-type: ")) {
+            content_type = line.substring(14);
+        }
+        if (line.startsWith("Content-Length: ") || line.startsWith("content-length: ")) {
+            content_length = line.substring(16).toInt();
+        }
+        if (line.startsWith("Transfer-Encoding: ") || line.startsWith("transfer-encoding: ")) {
+            String encoding = line.substring(19);
+            encoding.toLowerCase();
+            transfer_chunked = encoding.indexOf("chunked") >= 0;
+        }
+    }
+    
+    if (lvgl_port_lock(200)) {
+        String msg = "HTTP " + String(http_code) + "\nType: " + content_type.substring(0, 30) + "\nLen: " + String(content_length);
+        if (transfer_chunked) msg += "\nChunked";
+        ui_chat_set_campus_news_status(msg.c_str());
+        lvgl_port_unlock();
+    }
+
+    if (http_code == 0) {
+        if (lvgl_port_lock(200)) {
+            String msg = "ERR: no HTTP response\nWiFi=" + String(WiFi.status())
+                       + " host=" + host.substring(0, 28)
+                       + "\navail=" + String(client->available());
+            ui_chat_set_campus_news_status(msg.c_str());
+            lvgl_port_unlock();
+        }
+        close_client();
+        return false;
+    }
+    
+    // Handle redirect
+    if (http_code >= 300 && http_code < 400 && redirect_url.length() > 0) {
+        close_client();
+        if (redirect_url.startsWith("/")) {
+            redirect_url = String(is_https ? "https://" : "http://") + host + redirect_url;
+        }
+        return download_image(redirect_url);
+    }
+    
+    if (http_code != 200) {
+        close_client();
+        return false;
+    }
+    
+    // Download body
+    if (!news_jpeg_buf) {
+        news_jpeg_buf = (uint8_t *)ps_malloc(NEWS_JPEG_MAX);
+        if (!news_jpeg_buf) {
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_campus_news_status("ERR: ps_malloc JPEG FAILED!\nPSRAM het bo nho");
+                lvgl_port_unlock();
+            }
+            close_client();
+            return false;
+        }
+    }
+    
+    size_t downloaded = 0;
+    bool overflow = false;
+    t0 = millis();
+    if (transfer_chunked) {
+        while ((client->connected() || client->available()) && (millis() - t0 < 15000)) {
+            String chunk_line = client->readStringUntil('\n');
+            chunk_line.trim();
+            if (chunk_line.length() == 0) {
+                continue;
+            }
+            int semi = chunk_line.indexOf(';');
+            if (semi >= 0) chunk_line = chunk_line.substring(0, semi);
+            size_t chunk_len = strtoul(chunk_line.c_str(), nullptr, 16);
+            if (chunk_len == 0) {
+                break;
+            }
+            while (chunk_len > 0 && (millis() - t0 < 15000)) {
+                size_t toRead = chunk_len;
+                if (toRead > 2048) toRead = 2048;
+                if (downloaded + toRead > NEWS_JPEG_MAX) {
+                    toRead = NEWS_JPEG_MAX - downloaded;
+                    overflow = true;
+                }
+                if (toRead == 0) break;
+                int c = client->readBytes(news_jpeg_buf + downloaded, toRead);
+                if (c <= 0) break;
+                downloaded += c;
+                chunk_len -= c;
+                t0 = millis();
+            }
+            client->readStringUntil('\n');
+            if (overflow) break;
+        }
+    } else {
+        while ((client->connected() || client->available()) && (millis() - t0 < 15000) && downloaded < NEWS_JPEG_MAX) {
+            size_t avail = client->available();
+            if (avail) {
+                size_t toRead = avail;
+                if (downloaded + toRead > NEWS_JPEG_MAX) {
+                    toRead = NEWS_JPEG_MAX - downloaded;
+                    overflow = true;
+                }
+                int c = client->readBytes(news_jpeg_buf + downloaded, toRead);
+                downloaded += c;
+                t0 = millis();
+            }
+            delay(1);
+        }
+    }
+    close_client();
+    
+    if (lvgl_port_lock(200)) {
+        String msg = "Downloaded: " + String(downloaded) + " bytes\nDecoding JPEG...";
+        if (overflow) msg = "ERR: image >2MB\nTry smaller JPEG";
+        ui_chat_set_campus_news_status(msg.c_str());
+        lvgl_port_unlock();
+    }
+    
+    if (overflow) return false;
+    if (downloaded < 100) return false;
+    if (news_jpeg_buf[0] != 0xFF || news_jpeg_buf[1] != 0xD8) {
+        if (lvgl_port_lock(200)) {
+            String msg = "ERR: not JPEG data\nFirst bytes: "
+                       + String(news_jpeg_buf[0], HEX) + " "
+                       + String(news_jpeg_buf[1], HEX);
+            ui_chat_set_campus_news_status(msg.c_str());
+            lvgl_port_unlock();
+        }
+        return false;
+    }
+    
+    JDEC jd;
+    static uint8_t *pool = nullptr;
+    if (!pool) pool = (uint8_t *)malloc(4096);
+    if (!pool) return false;
+    
+    lv_color_t *canvas_buf = ui_chat_get_news_canvas_buffer();
+    if (!canvas_buf) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("ERR: canvas_buf NULL!\nVideo canvas chua san sang");
+            lvgl_port_unlock();
+        }
+        return false;
+    }
+    
+    JpgDecContext ctx;
+    ctx.data = news_jpeg_buf;
+    ctx.file = nullptr;
+    ctx.size = downloaded;
+    ctx.index = 0;
+    ctx.canvas_buf = (uint16_t *)canvas_buf;
+    ctx.canvas_width = 800;
+    ctx.canvas_height = 480;
+    ctx.blocks = 0;
+    ctx.scale = 1;
+
+    // Clear canvas in chunks to avoid watchdog
+    size_t total = 800 * 480 * sizeof(lv_color_t);
+    size_t chunk = 64 * 1024;
+    for (size_t off = 0; off < total; off += chunk) {
+        size_t len = (off + chunk > total) ? total - off : chunk;
+        memset((uint8_t*)canvas_buf + off, 0, len);
+        esp_task_wdt_reset();
+    }
+    
+    esp_task_wdt_reset();
+    Serial.printf("Campus JPEG prepare: %u bytes\n", (unsigned)downloaded);
+    JRESULT res = jd_prepare(&jd, jpg_infunc, pool, 4096, &ctx);
+    if (res != JDR_OK) {
+        if (lvgl_port_lock(200)) {
+            String msg = "ERR: jd_prepare=" + String(res) + "\nFile khong phai JPEG?";
+            ui_chat_set_campus_news_status(msg.c_str());
+            lvgl_port_unlock();
+        }
+        return false;
+    }
+    
+    Serial.printf("Campus JPEG decode start: %ux%u scale=%u\n", jd.width, jd.height, ctx.scale);
+    res = jd_decomp(&jd, jpg_outfunc, ctx.scale);
+    Serial.printf("Campus JPEG decode result: %d, blocks=%u\n", res, (unsigned)ctx.blocks);
+    if (res != JDR_OK) {
+        if (lvgl_port_lock(200)) {
+            String msg = "ERR: jd_decomp=" + String(res);
+            ui_chat_set_campus_news_status(msg.c_str());
+            lvgl_port_unlock();
+        }
+        return false;
+    }
+    
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_campus_news_status("");
+        ui_chat_refresh_news_canvas();
+        lvgl_port_unlock();
+    }
+    return true;
+}
+
+static bool is_jpeg_file_name(const String &name)
+{
+    String lower = name;
+    lower.toLowerCase();
+    return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+}
+
+static String make_storage_path(const char *dir_path, const String &name)
+{
+    if (name.startsWith("/")) {
+        return name;
+    }
+    if (strcmp(dir_path, "/") == 0) {
+        return "/" + name;
+    }
+    return String(dir_path) + "/" + name;
+}
+
+static void scan_campus_images_from_dir(const char *dir_path)
+{
+    if (campus_image_count >= MAX_CAMPUS_IMAGES) {
+        return;
+    }
+
+    File root = SD.open(dir_path);
+    if (!root) {
+        Serial.printf("Campus image dir missing: %s\n", dir_path);
+        return;
+    }
+    if (!root.isDirectory()) {
+        root.close();
+        return;
+    }
+
+    File file = root.openNextFile();
+    while (file && campus_image_count < MAX_CAMPUS_IMAGES) {
+        if (!file.isDirectory()) {
+            String name = file.name();
+            if (is_jpeg_file_name(name)) {
+                String path = make_storage_path(dir_path, name);
+                campus_image_paths[campus_image_count++] = path;
+                Serial.printf("Campus image[%u]: %s\n", campus_image_count, path.c_str());
+            }
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+}
+
+static bool decode_news_jpeg_file(File &file, size_t jpeg_size, const String &label)
+{
+    if (jpeg_size < 100) {
+        Serial.printf("Campus image too small: %s\n", label.c_str());
+        return false;
+    }
+
+    file.seek(0);
+    uint8_t soi[2] = {0, 0};
+    if (file.read(soi, 2) != 2 || soi[0] != 0xFF || soi[1] != 0xD8) {
+        Serial.printf("Campus image is not JPEG: %s\n", label.c_str());
+        return false;
+    }
+    file.seek(0);
+
+    JDEC jd;
+    static uint8_t *pool = nullptr;
+    if (!pool) {
+        pool = (uint8_t *)malloc(4096);
+    }
+    if (!pool) {
+        Serial.println("Campus JPEG decode pool allocation failed");
+        return false;
+    }
+
+    lv_color_t *canvas_buf = ui_chat_get_news_canvas_buffer();
+    if (!canvas_buf) {
+        Serial.println("Campus canvas buffer is NULL");
+        return false;
+    }
+
+    size_t total = 800 * 480 * sizeof(lv_color_t);
+    size_t chunk = 64 * 1024;
+    for (size_t off = 0; off < total; off += chunk) {
+        size_t len = (off + chunk > total) ? total - off : chunk;
+        memset((uint8_t*)canvas_buf + off, 0, len);
+        esp_task_wdt_reset();
+    }
+
+    JpgDecContext ctx;
+    ctx.data = nullptr;
+    ctx.file = &file;
+    ctx.size = jpeg_size;
+    ctx.index = 0;
+    ctx.canvas_buf = (uint16_t *)canvas_buf;
+    ctx.canvas_width = 800;
+    ctx.canvas_height = 480;
+    ctx.blocks = 0;
+    ctx.scale = 0;
+
+    esp_task_wdt_reset();
+    Serial.printf("Campus local JPEG prepare: %u bytes\n", (unsigned)jpeg_size);
+    JRESULT res = jd_prepare(&jd, jpg_infunc, pool, 4096, &ctx);
+    if (res != JDR_OK) {
+        Serial.printf("Campus JPEG prepare failed: %d file=%s\n", res, label.c_str());
+        return false;
+    }
+
+    while (ctx.scale < 3 && ((jd.width >> ctx.scale) > 800 || (jd.height >> ctx.scale) > 480)) {
+        ctx.scale++;
+    }
+
+    Serial.printf("Campus local JPEG decode start: %ux%u scale=%u\n", jd.width, jd.height, ctx.scale);
+    res = jd_decomp(&jd, jpg_outfunc, ctx.scale);
+    Serial.printf("Campus local JPEG decode result: %d, blocks=%u\n", res, (unsigned)ctx.blocks);
+    if (res != JDR_OK) {
+        Serial.printf("Campus JPEG decode failed: %d file=%s\n", res, label.c_str());
+        return false;
+    }
+
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_campus_news_status("");
+        ui_chat_refresh_news_canvas();
+        lvgl_port_unlock();
+    }
+    return true;
+}
+
+static bool load_local_campus_image(const String &path)
+{
+    File file = SD.open(path.c_str(), FILE_READ);
+    if (!file) {
+        Serial.printf("Cannot open campus image: %s\n", path.c_str());
+        return false;
+    }
+
+    size_t file_size = file.size();
+    if (file_size > LOCAL_JPEG_MAX) {
+        file.close();
+        Serial.printf("Campus image too large: %s size=%u\n", path.c_str(), (unsigned)file_size);
+        return false;
+    }
+
+    bool ok = decode_news_jpeg_file(file, file_size, path);
+    file.close();
+    return ok;
+}
+
+static void startCampusNews()
+{
+    is_campus_news_active = true;
+    
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_campus_news_status("Dang doc anh tu USB/SD...");
+        lvgl_port_unlock();
+    }
+
+    campus_image_count = 0;
+    current_campus_image_idx = 0;
+
+    if (!init_sd_card()) {
+        is_campus_news_active = false;
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("ERR: khong khoi tao duoc USB/SD");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+
+    scan_campus_images_from_dir("/campus");
+    scan_campus_images_from_dir("/images");
+    scan_campus_images_from_dir("/");
+
+    if (campus_image_count == 0) {
+        is_campus_news_active = false;
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("Khong tim thay JPG/JPEG\nDat anh vao /campus hoac /images");
+            lvgl_port_unlock();
+        }
+        return;
+    }
+    
+    if (lvgl_port_lock(200)) {
+        ui_chat_set_campus_news_status("");
+        lvgl_port_unlock();
+    }
+
+    last_banner_change_ms = 0;
+}
+
+static void handle_campus_news()
+{
+    Serial.println("Campus News request");
+    ui_chat_set_campus_news_status("Starting...");
+    ui_chat_show_campus_news();
+    pending_campus_news = true;
+}
+
+static void handle_campus_news_close()
+{
+    Serial.println("Campus News close");
+    is_campus_news_active = false;
+    ui_chat_hide_campus_news();
+}
+
+static volatile bool pending_video_start = false;
+
+static void startVideoPlayer()
+{
+    if (video_task_handle) {
+        video_task_stop = true;
+        for (int i = 0; i < 100 && video_task_handle; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (video_task_handle) {
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_video_status("Video task dang dung, thu lai sau...");
+                lvgl_port_unlock();
+            }
+            return;
+        }
     }
 
     if (!init_sd_card()) {
@@ -1166,23 +2019,54 @@ static void handle_video_start()
     if (!video_frame_buf) {
         video_frame_buf = (uint8_t *)ps_malloc(video_frame_buf_sz);
     }
+    if (!video_frame_buf) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("Loi: Khong du PSRAM cho video buffer!");
+            lvgl_port_unlock();
+        }
+        video_file.close();
+        return;
+    }
 
     is_playing_video = true;
+    video_task_stop = false;
     last_frame_time_ms = millis();
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        video_player_task,
+        "video_player",
+        24 * 1024,
+        nullptr,
+        1,
+        &video_task_handle,
+        0
+    );
+    if (ok != pdPASS) {
+        video_task_handle = nullptr;
+        is_playing_video = false;
+        video_file.close();
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_video_status("Loi: Khong tao duoc video task!");
+            lvgl_port_unlock();
+        }
+    }
+}
+
+static void handle_video_start()
+{
+    Serial.println("Video playback is disabled.");
 }
 
 static void handle_video_close()
 {
     Serial.println("Video close request");
+    video_task_stop = true;
+    for (int i = 0; i < 100 && video_task_handle; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     is_playing_video = false;
-    if (video_file) {
-        video_file.close();
-    }
 
-    if (lvgl_port_lock(200)) {
-        ui_chat_hide_video_player();
-        lvgl_port_unlock();
-    }
+    ui_chat_hide_video_player();
 }
 
 
@@ -1193,9 +2077,7 @@ void setup()
 
     Serial.begin(115200);
     AudioSerial.begin(AUDIO_UART_BAUD, SERIAL_8N1, AUDIO_UART_RX, AUDIO_UART_TX);
-    AudioSerial.print("HMI_UART_TEST\n");
     Serial.printf("[HMI UART] begin RX=%d TX=%d baud=%lu\n", AUDIO_UART_RX, AUDIO_UART_TX, (unsigned long)AUDIO_UART_BAUD);
-    Serial.println("[HMI UART TX] HMI_UART_TEST");
     delay(100);
     Serial.printf("PSRAM size: %u bytes\n", ESP.getPsramSize());
     if (ESP.getPsramSize() == 0) {
@@ -1205,7 +2087,6 @@ void setup()
     if (!pcm_buffer) {
         halt_on_error("Cannot allocate PSRAM audio buffer");
     }
-    ensureWiFi();
 
     Serial.println("Initializing board");
     Board *board = new Board();
@@ -1257,12 +2138,9 @@ void setup()
     ui_chat_set_new_chat_callback(handle_new_chat);
     ui_chat_set_open_history_callback(handle_open_history);
     ui_chat_set_history_callback(handle_history);
-    ui_chat_set_video_callback(handle_video_start);
-    ui_chat_set_video_close_callback(handle_video_close);
+    ui_chat_set_campus_news_callback(handle_campus_news);
+    ui_chat_set_campus_news_close_callback(handle_campus_news_close);
     ui_chat_init();
-
-    syncClockFromNtp();
-    updateDashboardClock();
 
     // Initialize a default session id at boot; a new one will be created on each "New chat".
     if (session_id.length() == 0) {
@@ -1271,10 +2149,76 @@ void setup()
 
     /* Release the mutex */
     lvgl_port_unlock();
+
+    ensureWiFi();
+    if (in_ap_mode) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_show_wifi_config_screen("UniMate-AP", "192.168.4.1");
+            lvgl_port_unlock();
+        }
+    } else {
+        syncClockFromNtp();
+        updateDashboardClock();
+    }
 }
 
 void loop()
 {
+    if (in_ap_mode) {
+        if (dns_server) dns_server->processNextRequest();
+        if (captive_server) captive_server->handleClient();
+    }
+
+    static uint32_t wifi_disconnect_time = 0;
+    if (!in_ap_mode) {
+        if (WiFi.status() != WL_CONNECTED) {
+            if (wifi_disconnect_time == 0) {
+                wifi_disconnect_time = millis();
+                WiFi.reconnect();
+            } else if (millis() - wifi_disconnect_time > 60000) {
+                Serial.println("WiFi disconnected > 60s. Fallback to AP mode.");
+                ensureWiFi();
+                if (in_ap_mode && lvgl_port_lock(200)) {
+                    ui_chat_show_wifi_config_screen("UniMate-AP", "192.168.4.1");
+                    lvgl_port_unlock();
+                }
+            }
+        } else {
+            wifi_disconnect_time = 0;
+        }
+    }
+
+    if (pending_open_history) {
+        pending_open_history = false;
+        showHistorySessionsInUi();
+    }
+    if (pending_history_load) {
+        pending_history_load = false;
+        loadHistoryData(pending_history_idx);
+    }
+    if (pending_campus_news) {
+        pending_campus_news = false;
+        startCampusNews();
+    }
+    
+    if (is_campus_news_active) {
+        uint32_t now = millis();
+        if (last_banner_change_ms == 0 || (now - last_banner_change_ms > 5000)) {
+            last_banner_change_ms = now;
+            if (campus_image_count > 0) {
+                if (lvgl_port_lock(50)) {
+                    ui_chat_set_campus_news_status("");
+                    lvgl_port_unlock();
+                }
+                String path = campus_image_paths[current_campus_image_idx];
+                if (!load_local_campus_image(path)) {
+                    Serial.println("Campus local image load failed; see Serial log.");
+                }
+                current_campus_image_idx = (current_campus_image_idx + 1) % campus_image_count;
+            }
+        }
+    }
+
     static enum { UART_LINE, UART_LEN0, UART_LEN1, UART_PAYLOAD } uart_state = UART_LINE;
     static String uart_line;
     static uint16_t frame_len = 0;
@@ -1368,14 +2312,6 @@ void loop()
             ui_status("Uploading...");
             Serial.printf("REC_STOP sent, pcm=%u\n", (unsigned)pcm_len);
             handleChatResponse(postVoiceWav());
-        }
-    }
-
-    if (is_playing_video) {
-        uint32_t now_ms = millis();
-        if (now_ms - last_frame_time_ms >= frame_interval_ms) {
-            last_frame_time_ms = now_ms;
-            play_next_video_frame();
         }
     }
 

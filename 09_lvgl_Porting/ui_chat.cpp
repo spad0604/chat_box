@@ -16,6 +16,7 @@ static lv_obj_t *typing_row;
 static lv_obj_t *typing_label;
 static lv_obj_t *keyboard;
 static lv_obj_t *voice_icon_box;
+static lv_obj_t *chat_mic_btn;
 static lv_obj_t *dashboard_mic_btn;
 static lv_obj_t *dashboard_mic_ring;
 static bool mic_is_recording;
@@ -23,10 +24,12 @@ static bool mic_is_recording;
 static ui_chat_text_cb_t on_send;
 static ui_chat_simple_cb_t on_mic;
 static ui_chat_simple_cb_t on_new_chat;
-static ui_chat_simple_cb_t on_open_history;
-static ui_chat_history_cb_t on_history;
-static ui_video_cb_t on_video_start;
-static ui_video_cb_t on_video_close;
+static ui_chat_simple_cb_t on_open_history = NULL;
+static ui_chat_history_cb_t on_history = NULL;
+static ui_video_cb_t on_video_start = NULL;
+static ui_video_cb_t on_video_close = NULL;
+static ui_chat_simple_cb_t on_campus_news = NULL;
+static ui_chat_simple_cb_t on_campus_news_close = NULL;
 
 static lv_obj_t *video_screen;
 static lv_obj_t *video_canvas;
@@ -506,11 +509,31 @@ static void update_mic_recording_ui()
             lv_obj_add_style(dashboard_mic_btn, &style_send_button, 0);
         }
     }
+
+    if (chat_mic_btn) {
+        lv_obj_clean(chat_mic_btn);
+        if (mic_is_recording) {
+            lv_obj_remove_style(chat_mic_btn, &style_send_button, 0);
+            lv_obj_add_style(chat_mic_btn, &style_mic_recording, 0);
+        } else {
+            lv_obj_remove_style(chat_mic_btn, &style_mic_recording, 0);
+            lv_obj_add_style(chat_mic_btn, &style_send_button, 0);
+        }
+        make_mic_icon(chat_mic_btn, lv_color_hex(0xffffff));
+    }
 }
 
 static void back_event_cb(lv_event_t *e)
 {
     LV_UNUSED(e);
+    if (mic_is_recording) {
+        mic_is_recording = false;
+        update_mic_recording_ui();
+        ui_chat_set_status("Online");
+        if (on_mic) {
+            on_mic();
+        }
+    }
     show_dashboard_screen();
 }
 
@@ -575,6 +598,9 @@ static void mic_event_cb(lv_event_t *e)
     LV_UNUSED(e);
     mic_is_recording = !mic_is_recording;
     update_mic_recording_ui();
+    if (mic_is_recording) {
+        show_chat_screen();
+    }
     if (on_mic) {
         on_mic();
     }
@@ -596,12 +622,9 @@ static void new_chat_event_cb(lv_event_t *e)
 static void campus_news_event_cb(lv_event_t *e)
 {
     LV_UNUSED(e);
-    ui_chat_clear_messages();
-    ui_chat_add_message("assistant", "Hi! I'm UniMate. How can I help you today?");
-    ui_chat_add_message("user", "Show me campus news.");
-    ui_chat_add_message("assistant", "Today's campus highlights are available in the student portal under News and Events.");
-    ui_chat_set_status("Campus News");
-    show_chat_screen();
+    if (on_campus_news) {
+        on_campus_news();
+    }
 }
 
 static void history_open_event_cb(lv_event_t *e)
@@ -721,9 +744,7 @@ static void create_dashboard()
     lv_obj_set_flex_align(cards, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_bg_opa(cards, LV_OPA_TRANSP, 0);
     make_action_card(cards, "AI Chat", "AI", &style_icon_orange, new_chat_event_cb, NULL);
-    make_action_card(cards, "Voice Assistant", NULL, &style_icon_blue, mic_event_cb, NULL);
     make_action_card(cards, "Campus News", LV_SYMBOL_FILE, &style_icon_green, campus_news_event_cb, NULL);
-    make_action_card(cards, "Play Video", LV_SYMBOL_VIDEO, &style_icon_red, play_video_event_cb, NULL);
 
     dashboard_mic_ring = make_circle(dashboard_screen, at_least(sx(96), 68), lv_color_hex(0xffd9bd), LV_OPA_60);
     lv_obj_align(dashboard_mic_ring, LV_ALIGN_BOTTOM_MID, 0, -sy(22));
@@ -817,6 +838,14 @@ static void create_chat()
     lv_textarea_set_placeholder_text(input_ta, "Type a message...");
     lv_obj_add_event_cb(input_ta, input_event_cb, LV_EVENT_FOCUSED, NULL);
 
+    chat_mic_btn = lv_btn_create(input_bar);
+    lv_obj_remove_style_all(chat_mic_btn);
+    lv_obj_add_style(chat_mic_btn, &style_send_button, 0);
+    lv_obj_set_size(chat_mic_btn, at_least(sx(50), 46), at_least(sy(50), 46));
+    lv_obj_set_style_radius(chat_mic_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_add_event_cb(chat_mic_btn, mic_event_cb, LV_EVENT_CLICKED, NULL);
+    make_mic_icon(chat_mic_btn, lv_color_hex(0xffffff));
+
     lv_obj_t *send_btn = lv_btn_create(input_bar);
     lv_obj_remove_style_all(send_btn);
     lv_obj_add_style(send_btn, &style_send_button, 0);
@@ -840,7 +869,6 @@ void ui_chat_init()
     init_styles();
     create_dashboard();
     create_chat();
-    create_video_player();
 
     ui_chat_add_message("assistant", "Hi! I'm UniMate. How can I help you today?");
 
@@ -1075,3 +1103,134 @@ static void video_close_event_cb(lv_event_t *e)
         on_video_close();
     }
 }
+
+static lv_obj_t *wifi_screen = NULL;
+static lv_obj_t *wifi_ssid_label = NULL;
+static lv_obj_t *wifi_ip_label = NULL;
+
+void ui_chat_show_wifi_config_screen(const char *ssid, const char *ip)
+{
+    if (!wifi_screen) {
+        wifi_screen = lv_obj_create(NULL);
+        lv_obj_remove_style_all(wifi_screen);
+        lv_obj_add_style(wifi_screen, &style_screen, 0);
+        
+        lv_obj_t *title = make_label(wifi_screen, "WiFi Config", &style_title);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, sy(150));
+        
+        lv_obj_t *desc = make_label(wifi_screen, "Please connect your phone to the following WiFi\nand go to the IP address to configure.", &style_text_muted);
+        lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(desc, LV_ALIGN_TOP_MID, 0, sy(220));
+        
+        wifi_ssid_label = make_label(wifi_screen, "", &style_text_dark);
+        lv_obj_set_style_text_font(wifi_ssid_label, &lv_font_montserrat_30, 0);
+        lv_obj_set_style_text_color(wifi_ssid_label, lv_color_hex(0xff7417), 0);
+        lv_obj_align(wifi_ssid_label, LV_ALIGN_TOP_MID, 0, sy(300));
+        
+        wifi_ip_label = make_label(wifi_screen, "", &style_text_dark);
+        lv_obj_set_style_text_font(wifi_ip_label, &lv_font_montserrat_30, 0);
+        lv_obj_set_style_text_color(wifi_ip_label, lv_color_hex(0xff7417), 0);
+        lv_obj_align(wifi_ip_label, LV_ALIGN_TOP_MID, 0, sy(360));
+    }
+    
+    if (ssid) lv_label_set_text_fmt(wifi_ssid_label, "SSID: %s", ssid);
+    if (ip) lv_label_set_text_fmt(wifi_ip_label, "IP: %s", ip);
+    
+    lv_scr_load(wifi_screen);
+}
+
+static lv_obj_t *news_screen = NULL;
+static lv_obj_t *news_canvas = NULL;
+static lv_color_t *news_canvas_buf = NULL;
+static lv_obj_t *news_status_label = NULL;
+
+static void news_close_event_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    if (on_campus_news_close) {
+        on_campus_news_close();
+    }
+}
+
+void ui_chat_set_campus_news_callback(ui_chat_simple_cb_t cb)
+{
+    on_campus_news = cb;
+}
+
+void ui_chat_set_campus_news_close_callback(ui_chat_simple_cb_t cb)
+{
+    on_campus_news_close = cb;
+}
+
+void ui_chat_show_campus_news()
+{
+    if (!news_screen) {
+        news_screen = lv_obj_create(NULL);
+        lv_obj_remove_style_all(news_screen);
+        lv_obj_add_style(news_screen, &style_screen, 0);
+        lv_obj_set_size(news_screen, LV_PCT(100), LV_PCT(100));
+        lv_obj_clear_flag(news_screen, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(news_screen, LV_SCROLLBAR_MODE_OFF);
+
+        news_canvas_buf = (lv_color_t *)ps_malloc(800 * 480 * sizeof(lv_color_t));
+        if (news_canvas_buf) {
+            memset(news_canvas_buf, 0, 800 * 480 * sizeof(lv_color_t));
+        }
+
+        if (news_canvas_buf) {
+            news_canvas = lv_canvas_create(news_screen);
+            lv_canvas_set_buffer(news_canvas, news_canvas_buf, 800, 480, LV_IMG_CF_TRUE_COLOR);
+            lv_obj_align(news_canvas, LV_ALIGN_CENTER, 0, 0);
+        }
+
+        news_status_label = lv_label_create(news_screen);
+        lv_obj_add_style(news_status_label, &style_text_dark, 0);
+        lv_obj_set_style_text_font(news_status_label, &font_vietnamese_16, 0);
+        lv_obj_set_style_text_color(news_status_label, lv_color_hex(0x333333), 0);
+        lv_label_set_text(news_status_label, "Loading...");
+        lv_obj_align(news_status_label, LV_ALIGN_CENTER, 0, 0);
+
+        lv_obj_t *close_btn = lv_btn_create(news_screen);
+        lv_obj_remove_style_all(close_btn);
+        lv_obj_add_style(close_btn, &style_close_button, 0);
+        lv_obj_set_size(close_btn, at_least(sx(48), 44), at_least(sx(48), 44));
+        lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -sx(20), sy(20));
+        lv_obj_add_event_cb(close_btn, news_close_event_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *close_label = lv_label_create(close_btn);
+        lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+        lv_obj_center(close_label);
+    }
+    
+    lv_scr_load_anim(news_screen, LV_SCR_LOAD_ANIM_FADE_ON, 140, 0, false);
+}
+
+void ui_chat_hide_campus_news()
+{
+    show_dashboard_screen();
+}
+
+void ui_chat_set_campus_news_status(const char *status)
+{
+    if (news_status_label) {
+        if (status && strlen(status) > 0) {
+            lv_label_set_text(news_status_label, status);
+            lv_obj_clear_flag(news_status_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(news_status_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+lv_color_t* ui_chat_get_news_canvas_buffer()
+{
+    return news_canvas_buf;
+}
+
+void ui_chat_refresh_news_canvas()
+{
+    if (news_canvas) {
+        lv_obj_invalidate(news_canvas);
+    }
+}
+

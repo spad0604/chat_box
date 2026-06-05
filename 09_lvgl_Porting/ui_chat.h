@@ -33,3 +33,12 @@ lv_color_t* ui_chat_get_video_canvas_buffer();
 void ui_chat_refresh_video_canvas();
 void ui_chat_set_video_status(const char *status);
 
+void ui_chat_show_wifi_config_screen(const char *ssid, const char *ip);
+
+void ui_chat_set_campus_news_callback(ui_chat_simple_cb_t cb);
+void ui_chat_set_campus_news_close_callback(ui_chat_simple_cb_t cb);
+void ui_chat_show_campus_news();
+void ui_chat_hide_campus_news();
+void ui_chat_set_campus_news_status(const char *status);
+lv_color_t* ui_chat_get_news_canvas_buffer();
+void ui_chat_refresh_news_canvas();
