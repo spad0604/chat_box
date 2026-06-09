@@ -32,6 +32,145 @@ router.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
+const uploadImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 512 * 1024 } });
+
+// Helper to get all campus images sorted chronologically (alphabetically by timestamp name)
+function getCampusImagesList() {
+  const campusDir = path.resolve('storage', 'campus');
+  if (!fs.existsSync(campusDir)) {
+    return [];
+  }
+  return fs.readdirSync(campusDir)
+    .filter(file => /\.(jpg|jpeg|png|webp|gif)$/i.test(file))
+    .sort();
+}
+
+// POST: Upload a new campus image to the list
+router.post('/campus-images', uploadImage.single('file'), (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ detail: 'file is required' });
+    }
+    if (!req.file.mimetype.startsWith('image/')) {
+      return res.status(400).json({ detail: 'file must be an image' });
+    }
+
+    const campusDir = path.resolve('storage', 'campus');
+    if (!fs.existsSync(campusDir)) {
+      fs.mkdirSync(campusDir, { recursive: true });
+    }
+
+    // Generate chronological name
+    const timestamp = Date.now();
+    const rand = Math.random().toString(36).substring(2, 8);
+    const ext = path.extname(req.file.originalname) || '.jpg';
+    const filename = `image_${timestamp}_${rand}${ext}`;
+    const imagePath = path.join(campusDir, filename);
+
+    fs.writeFileSync(imagePath, req.file.buffer);
+
+    return res.json({
+      detail: 'Image uploaded successfully',
+      filename,
+      url: `${chatConfig.publicBaseUrl}/api/v1/campus-images/${filename}`
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET: Retrieve the list of campus images with URLs
+router.get('/campus-images', (req, res) => {
+  try {
+    const files = getCampusImagesList();
+    const images = files.map(file => ({
+      filename: file,
+      url: `${chatConfig.publicBaseUrl}/api/v1/campus-images/${file}`
+    }));
+    return res.json({ images });
+  } catch (error) {
+    return res.status(500).json({ detail: error.message });
+  }
+});
+
+// GET: Serve a specific campus image file
+router.get('/campus-images/:filename', (req, res) => {
+  const filename = req.params.filename;
+  if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+    return res.status(400).json({ detail: 'Invalid filename' });
+  }
+  const imagePath = path.resolve('storage', 'campus', filename);
+  if (!fs.existsSync(imagePath)) {
+    return res.status(404).json({ detail: 'Image not found' });
+  }
+  return res.sendFile(imagePath);
+});
+
+// DELETE: Delete a specific campus image from the list
+router.delete('/campus-images/:filename', (req, res) => {
+  const filename = req.params.filename;
+  if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+    return res.status(400).json({ detail: 'Invalid filename' });
+  }
+  const imagePath = path.resolve('storage', 'campus', filename);
+  if (!fs.existsSync(imagePath)) {
+    return res.status(404).json({ detail: 'Image not found' });
+  }
+  fs.unlinkSync(imagePath);
+  return res.json({ detail: 'Image deleted successfully' });
+});
+
+// POST: Backward-compatible single image upload
+router.post('/campus-image', uploadImage.single('file'), (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ detail: 'file is required' });
+    }
+    if (!req.file.mimetype.startsWith('image/')) {
+      return res.status(400).json({ detail: 'file must be an image' });
+    }
+
+    const storageDir = path.resolve('storage');
+    if (!fs.existsSync(storageDir)) {
+      fs.mkdirSync(storageDir, { recursive: true });
+    }
+
+    const imagePath = path.join(storageDir, 'campus.jpg');
+    fs.writeFileSync(imagePath, req.file.buffer);
+
+    // Also copy to the list so it appears there
+    const campusDir = path.resolve('storage', 'campus');
+    if (!fs.existsSync(campusDir)) {
+      fs.mkdirSync(campusDir, { recursive: true });
+    }
+    const filename = `image_${Date.now()}_legacy.jpg`;
+    fs.writeFileSync(path.join(campusDir, filename), req.file.buffer);
+
+    return res.json({
+      detail: 'Image uploaded successfully',
+      url: `${chatConfig.publicBaseUrl}/api/v1/campus-image`
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET: Backward-compatible single image retrieval (returns the latest image or fallback)
+router.get('/campus-image', (req, res) => {
+  const files = getCampusImagesList();
+  if (files.length > 0) {
+    // Return the latest one (which is the last one in chronological sort)
+    const latestFile = files[files.length - 1];
+    return res.sendFile(path.resolve('storage', 'campus', latestFile));
+  }
+
+  const legacyPath = path.resolve('storage', 'campus.jpg');
+  if (!fs.existsSync(legacyPath)) {
+    return res.status(404).json({ detail: 'Campus image not found' });
+  }
+  return res.sendFile(legacyPath);
+});
+
 router.get('/chat/sessions', async (req, res, next) => {
   try {
     const limit = clampInt(req.query.limit, 50, 1, 500);

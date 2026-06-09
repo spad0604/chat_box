@@ -32,10 +32,6 @@ static const int SPK_BCLK = 27;
 // Speaker volume. Increase later if stable: 2.0f, 2.5f, 3.0f.
 #define VOLUME_GAIN 1.5f
 
-// Volume control potentiometer pin
-static const int VOL_POT_PIN = 33;
-static float g_vol_mult = 1.0f;
-
 // Smaller chunks reduce instantaneous current.
 #define PCM_FRAMES_PER_CHUNK 128
 #define MIC_FRAMES_PER_CHUNK 160
@@ -47,6 +43,7 @@ static const i2s_port_t I2S_MIC_PORT = I2S_NUM_1;
 static String hmi_line;
 static bool mic_installed = false;
 static bool recording_enabled = false;
+static bool speaker_installed = false;
 
 // Global buffers to avoid stack pressure.
 static int16_t inputBuffer[PCM_FRAMES_PER_CHUNK * 2];
@@ -80,7 +77,7 @@ static int16_t amplifySampleRamp(int16_t input, uint32_t frameIndex) {
     ramp = (float)frameIndex / (float)rampFrames;
   }
 
-  int32_t value = (int32_t)((float)input * VOLUME_GAIN * ramp * g_vol_mult);
+  int32_t value = (int32_t)((float)input * VOLUME_GAIN * ramp);
   if (value > 32767) value = 32767;
   if (value < -32768) value = -32768;
   return (int16_t)value;
@@ -293,7 +290,16 @@ static bool parseWavHeader(WiFiClient &client, WavInfo &info) {
   }
 }
 
-static void setupSpeaker() {
+static bool setupSpeaker() {
+#ifdef AMP_SD_PIN
+  pinMode(AMP_SD_PIN, OUTPUT);
+  digitalWrite(AMP_SD_PIN, HIGH); // keep MAX98357A enabled
+#endif
+
+  if (speaker_installed) {
+    return true;
+  }
+
   i2s_config_t config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SPEAKER_SAMPLE_RATE,
@@ -318,13 +324,26 @@ static void setupSpeaker() {
 
   esp_err_t err = i2s_driver_install(I2S_SPK_PORT, &config, 0, NULL);
   Serial.printf("Spk i2s_driver_install: %s\n", esp_err_to_name(err));
-  if (err != ESP_OK) return;
+  if (err == ESP_ERR_INVALID_STATE) {
+    // Driver was already installed by a previous setup path.
+    speaker_installed = true;
+  } else if (err != ESP_OK) {
+    speaker_installed = false;
+    return false;
+  } else {
+    speaker_installed = true;
+  }
 
   err = i2s_set_pin(I2S_SPK_PORT, &pins);
   Serial.printf("Spk i2s_set_pin: %s\n", esp_err_to_name(err));
-  if (err != ESP_OK) return;
+  if (err != ESP_OK) {
+    i2s_driver_uninstall(I2S_SPK_PORT);
+    speaker_installed = false;
+    return false;
+  }
 
   i2s_zero_dma_buffer(I2S_SPK_PORT);
+  return true;
 }
 
 static bool installMic() {
@@ -383,6 +402,11 @@ static void uninstallMic() {
 }
 
 static void writeSilenceMs(uint32_t ms) {
+  if (!setupSpeaker()) {
+    Serial.println("Cannot write silence: speaker init failed");
+    return;
+  }
+
   memset(silenceBuffer, 0, sizeof(silenceBuffer));
   uint32_t start = millis();
   while (millis() - start < ms) {
@@ -492,6 +516,14 @@ static bool playWavFromUrl(const String &audioUrl) {
     return false;
   }
 
+  // Keep speaker I2S installed across plays. Reinstalling/uninstalling I2S0 every
+  // playback can leave MAX98357A with stale/missing clocks on the next play.
+  if (!setupSpeaker()) {
+    Serial.println("Speaker init failed");
+    client.stop();
+    return false;
+  }
+
 #ifdef AMP_SD_PIN
   digitalWrite(AMP_SD_PIN, HIGH);
   delay(50);
@@ -570,11 +602,13 @@ static bool playWavFromUrl(const String &audioUrl) {
     delay(0);
   }
 
-  writeSilenceMs(150);
+  writeSilenceMs(300);
   i2s_zero_dma_buffer(I2S_SPK_PORT);
 
 #ifdef AMP_SD_PIN
-  digitalWrite(AMP_SD_PIN, LOW);
+  // Keep amp enabled. Pulling SD/EN low after playback can make the next playback silent
+  // if the pin or module enable state is not restored cleanly.
+  digitalWrite(AMP_SD_PIN, HIGH);
 #endif
 
   client.stop();
@@ -736,9 +770,6 @@ void setup() {
   delay(700);
   Serial.setTimeout(20);
 
-  // Read volume only once at startup to avoid WiFi/I2S conflicts
-  g_vol_mult = (float)analogRead(VOL_POT_PIN) / 4095.0f;
-
   Serial.println();
   Serial.println("Audio board stable build: speaker + lazy mic");
   Serial.print("Reset reason: ");
@@ -748,7 +779,7 @@ void setup() {
 
 #ifdef AMP_SD_PIN
   pinMode(AMP_SD_PIN, OUTPUT);
-  digitalWrite(AMP_SD_PIN, LOW);
+  digitalWrite(AMP_SD_PIN, HIGH);
 #endif
 
   HmiSerial.begin(HMI_BAUD, SERIAL_8N1, HMI_RX, HMI_TX);
@@ -758,7 +789,9 @@ void setup() {
   Serial.println("Mic lazy mode: pins high-Z until REC_START");
 
   connectWiFi();
-  setupSpeaker();
+  if (!setupSpeaker()) {
+    Serial.println("Speaker init failed at boot");
+  }
 
   Serial.println("Audio board ready");
   Serial.printf("USB debug baud=%lu, HMI UART RX=%d TX=%d baud=%lu\n",

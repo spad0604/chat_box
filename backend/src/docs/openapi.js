@@ -209,6 +209,117 @@ export const openApiSpec = {
         responses: { 200: { description: 'Audio file' }, 404: errorResponse() },
       },
     },
+    '/api/v1/campus-image': {
+      get: {
+        tags: ['chat'],
+        summary: 'Get latest campus image (backward compatible)',
+        responses: { 200: { description: 'Campus image file' }, 404: errorResponse() },
+      },
+      post: {
+        tags: ['chat'],
+        summary: 'Upload single campus image (backward compatible, max 512KB)',
+        requestBody: multipartBody({ file: { type: 'string', format: 'binary' } }),
+        responses: {
+          200: {
+            description: 'Upload success',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    detail: { type: 'string' },
+                    url: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          400: errorResponse(),
+        },
+      },
+    },
+    '/api/v1/campus-images': {
+      get: {
+        tags: ['chat'],
+        summary: 'Get list of all campus images',
+        responses: {
+          200: {
+            description: 'List of images',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    images: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          filename: { type: 'string' },
+                          url: { type: 'string' },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      post: {
+        tags: ['chat'],
+        summary: 'Upload an image to the campus list (max 512KB)',
+        requestBody: multipartBody({ file: { type: 'string', format: 'binary' } }),
+        responses: {
+          200: {
+            description: 'Upload success',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    detail: { type: 'string' },
+                    filename: { type: 'string' },
+                    url: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          400: errorResponse(),
+        },
+      },
+    },
+    '/api/v1/campus-images/{filename}': {
+      get: {
+        tags: ['chat'],
+        summary: 'Get a specific campus image',
+        parameters: [pathParam('filename')],
+        responses: { 200: { description: 'Image file' }, 404: errorResponse() },
+      },
+      delete: {
+        tags: ['chat'],
+        summary: 'Delete a specific campus image from list',
+        parameters: [pathParam('filename')],
+        responses: {
+          200: {
+            description: 'Delete success',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    detail: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          404: errorResponse(),
+        },
+      },
+    },
     '/api/v1/asr/fpt': {
       post: {
         tags: ['asr'],

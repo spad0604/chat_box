@@ -1139,6 +1139,9 @@ struct JpgDecContext {
     int canvas_height;
     uint32_t blocks;
     uint8_t scale;
+    uint16_t *temp_buf = nullptr;
+    int image_width = 0;
+    int image_height = 0;
 };
 
 static UINT jpg_infunc(JDEC *jd, BYTE *buff, UINT nbyte)
@@ -1184,44 +1187,69 @@ static UINT jpg_infunc(JDEC *jd, BYTE *buff, UINT nbyte)
 static UINT jpg_outfunc(JDEC *jd, void *bitmap, JRECT *rect)
 {
     JpgDecContext *ctx = (JpgDecContext *)jd->device;
-    if (!ctx || !ctx->canvas_buf || !bitmap) {
+    if (!ctx || (!ctx->canvas_buf && !ctx->temp_buf) || !bitmap) {
         return 0;
     }
 
     int w = rect->right - rect->left + 1;
     int h = rect->bottom - rect->top + 1;
 
-    int decoded_width = jd->width >> ctx->scale;
-    int decoded_height = jd->height >> ctx->scale;
-    if (decoded_width <= 0) decoded_width = jd->width;
-    if (decoded_height <= 0) decoded_height = jd->height;
+    if (ctx->temp_buf) {
+        // Write directly to temporary buffer (for scaling up later)
+        for (int y = 0; y < h; y++) {
+            int cy = rect->top + y;
+            if (cy >= ctx->image_height) break;
+            int dest_row = cy * ctx->image_width;
 
-    int offset_x = (ctx->canvas_width - decoded_width) / 2;
-    int offset_y = (ctx->canvas_height - decoded_height) / 2;
-    if (offset_x < 0) offset_x = 0;
-    if (offset_y < 0) offset_y = 0;
+            for (int x = 0; x < w; x++) {
+                int cx = rect->left + x;
+                if (cx >= ctx->image_width) break;
 
-    if (rect->left >= ctx->canvas_width || rect->top >= ctx->canvas_height) {
-        return 1;
-    }
+                uint16_t color;
+                #if JD_FORMAT == 1
+                color = ((uint16_t *)bitmap)[y * w + x];
+                #else
+                uint8_t *p = &((uint8_t *)bitmap)[(y * w + x) * 3];
+                color = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
+                #endif
 
-    for (int y = 0; y < h; y++) {
-        int cy = rect->top + y + offset_y;
-        if (cy >= ctx->canvas_height) break;
+                ctx->temp_buf[dest_row + cx] = color;
+            }
+        }
+    } else {
+        // Direct decode to canvas
+        int decoded_width = jd->width >> ctx->scale;
+        int decoded_height = jd->height >> ctx->scale;
+        if (decoded_width <= 0) decoded_width = jd->width;
+        if (decoded_height <= 0) decoded_height = jd->height;
 
-        for (int x = 0; x < w; x++) {
-            int cx = rect->left + x + offset_x;
-            if (cx >= ctx->canvas_width) break;
+        int offset_x = (ctx->canvas_width - decoded_width) / 2;
+        int offset_y = (ctx->canvas_height - decoded_height) / 2;
+        if (offset_x < 0) offset_x = 0;
+        if (offset_y < 0) offset_y = 0;
 
-            uint16_t color;
-            #if JD_FORMAT == 1
-            color = ((uint16_t *)bitmap)[y * w + x];
-            #else
-            uint8_t *p = &((uint8_t *)bitmap)[(y * w + x) * 3];
-            color = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
-            #endif
+        if (rect->left >= ctx->canvas_width || rect->top >= ctx->canvas_height) {
+            return 1;
+        }
 
-            ctx->canvas_buf[cy * ctx->canvas_width + cx] = color;
+        for (int y = 0; y < h; y++) {
+            int cy = rect->top + y + offset_y;
+            if (cy >= ctx->canvas_height) break;
+
+            for (int x = 0; x < w; x++) {
+                int cx = rect->left + x + offset_x;
+                if (cx >= ctx->canvas_width) break;
+
+                uint16_t color;
+                #if JD_FORMAT == 1
+                color = ((uint16_t *)bitmap)[y * w + x];
+                #else
+                uint8_t *p = &((uint8_t *)bitmap)[(y * w + x) * 3];
+                color = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
+                #endif
+
+                ctx->canvas_buf[cy * ctx->canvas_width + cx] = color;
+            }
         }
     }
 
@@ -1724,16 +1752,7 @@ static bool download_image(const String& url) {
     ctx.canvas_width = 800;
     ctx.canvas_height = 480;
     ctx.blocks = 0;
-    ctx.scale = 1;
-
-    // Clear canvas in chunks to avoid watchdog
-    size_t total = 800 * 480 * sizeof(lv_color_t);
-    size_t chunk = 64 * 1024;
-    for (size_t off = 0; off < total; off += chunk) {
-        size_t len = (off + chunk > total) ? total - off : chunk;
-        memset((uint8_t*)canvas_buf + off, 0, len);
-        esp_task_wdt_reset();
-    }
+    ctx.scale = 0; // Calculated dynamically after jd_prepare
     
     esp_task_wdt_reset();
     Serial.printf("Campus JPEG prepare: %u bytes\n", (unsigned)downloaded);
@@ -1747,16 +1766,71 @@ static bool download_image(const String& url) {
         return false;
     }
     
+    // Determine scale dynamically
+    ctx.scale = 0;
+    while (ctx.scale < 3 && ((jd.width >> ctx.scale) > 800 || (jd.height >> ctx.scale) > 480)) {
+        ctx.scale++;
+    }
+
+    int decoded_w = jd.width >> ctx.scale;
+    int decoded_h = jd.height >> ctx.scale;
+    if (decoded_w <= 0) decoded_w = jd.width;
+    if (decoded_h <= 0) decoded_h = jd.height;
+
+    uint16_t *temp_buf = nullptr;
+    // If image is smaller than screen, decode to temp buffer first and scale up
+    if (decoded_w < 800 || decoded_h < 480) {
+        temp_buf = (uint16_t *)ps_malloc(decoded_w * decoded_h * sizeof(uint16_t));
+        if (temp_buf) {
+            ctx.temp_buf = temp_buf;
+            ctx.image_width = decoded_w;
+            ctx.image_height = decoded_h;
+            Serial.printf("Campus JPEG scale active: %dx%d -> 800x480\n", decoded_w, decoded_h);
+        }
+    }
+
+    if (!temp_buf) {
+        // Clear canvas in chunks to avoid watchdog
+        size_t total = 800 * 480 * sizeof(lv_color_t);
+        size_t chunk = 64 * 1024;
+        for (size_t off = 0; off < total; off += chunk) {
+            size_t len = (off + chunk > total) ? total - off : chunk;
+            memset((uint8_t*)canvas_buf + off, 0, len);
+            esp_task_wdt_reset();
+        }
+    }
+
     Serial.printf("Campus JPEG decode start: %ux%u scale=%u\n", jd.width, jd.height, ctx.scale);
     res = jd_decomp(&jd, jpg_outfunc, ctx.scale);
     Serial.printf("Campus JPEG decode result: %d, blocks=%u\n", res, (unsigned)ctx.blocks);
     if (res != JDR_OK) {
+        if (temp_buf) {
+            free(temp_buf);
+        }
         if (lvgl_port_lock(200)) {
             String msg = "ERR: jd_decomp=" + String(res);
             ui_chat_set_campus_news_status(msg.c_str());
             lvgl_port_unlock();
         }
         return false;
+    }
+
+    if (temp_buf) {
+        // Nearest-neighbor upscale to fill the 800x480 canvas
+        for (int cy = 0; cy < 480; cy++) {
+            int sy = (cy * decoded_h) / 480;
+            int dest_row_offset = cy * 800;
+            int src_row_offset = sy * decoded_w;
+            for (int cx = 0; cx < 800; cx++) {
+                int sx = (cx * decoded_w) / 800;
+                ((uint16_t *)canvas_buf)[dest_row_offset + cx] = temp_buf[src_row_offset + sx];
+            }
+            if ((cy & 0x1F) == 0) {
+                esp_task_wdt_reset();
+            }
+        }
+        free(temp_buf);
+        Serial.println("Upscaled campus image to fill screen");
     }
     
     if (lvgl_port_lock(200)) {
@@ -1848,14 +1922,6 @@ static bool decode_news_jpeg_file(File &file, size_t jpeg_size, const String &la
         return false;
     }
 
-    size_t total = 800 * 480 * sizeof(lv_color_t);
-    size_t chunk = 64 * 1024;
-    for (size_t off = 0; off < total; off += chunk) {
-        size_t len = (off + chunk > total) ? total - off : chunk;
-        memset((uint8_t*)canvas_buf + off, 0, len);
-        esp_task_wdt_reset();
-    }
-
     JpgDecContext ctx;
     ctx.data = nullptr;
     ctx.file = &file;
@@ -1879,12 +1945,57 @@ static bool decode_news_jpeg_file(File &file, size_t jpeg_size, const String &la
         ctx.scale++;
     }
 
+    int decoded_w = jd.width >> ctx.scale;
+    int decoded_h = jd.height >> ctx.scale;
+    if (decoded_w <= 0) decoded_w = jd.width;
+    if (decoded_h <= 0) decoded_h = jd.height;
+
+    uint16_t *temp_buf = nullptr;
+    if (decoded_w < 800 || decoded_h < 480) {
+        temp_buf = (uint16_t *)ps_malloc(decoded_w * decoded_h * sizeof(uint16_t));
+        if (temp_buf) {
+            ctx.temp_buf = temp_buf;
+            ctx.image_width = decoded_w;
+            ctx.image_height = decoded_h;
+            Serial.printf("Campus local JPEG scale active: %dx%d -> 800x480\n", decoded_w, decoded_h);
+        }
+    }
+
+    if (!temp_buf) {
+        size_t total = 800 * 480 * sizeof(lv_color_t);
+        size_t chunk = 64 * 1024;
+        for (size_t off = 0; off < total; off += chunk) {
+            size_t len = (off + chunk > total) ? total - off : chunk;
+            memset((uint8_t*)canvas_buf + off, 0, len);
+            esp_task_wdt_reset();
+        }
+    }
+
     Serial.printf("Campus local JPEG decode start: %ux%u scale=%u\n", jd.width, jd.height, ctx.scale);
     res = jd_decomp(&jd, jpg_outfunc, ctx.scale);
     Serial.printf("Campus local JPEG decode result: %d, blocks=%u\n", res, (unsigned)ctx.blocks);
     if (res != JDR_OK) {
+        if (temp_buf) free(temp_buf);
         Serial.printf("Campus JPEG decode failed: %d file=%s\n", res, label.c_str());
         return false;
+    }
+
+    if (temp_buf) {
+        // Nearest-neighbor upscale to fill the 800x480 canvas
+        for (int cy = 0; cy < 480; cy++) {
+            int sy = (cy * decoded_h) / 480;
+            int dest_row_offset = cy * 800;
+            int src_row_offset = sy * decoded_w;
+            for (int cx = 0; cx < 800; cx++) {
+                int sx = (cx * decoded_w) / 800;
+                ((uint16_t *)canvas_buf)[dest_row_offset + cx] = temp_buf[src_row_offset + sx];
+            }
+            if ((cy & 0x1F) == 0) {
+                esp_task_wdt_reset();
+            }
+        }
+        free(temp_buf);
+        Serial.println("Upscaled campus local image to fill screen");
     }
 
     if (lvgl_port_lock(200)) {
@@ -1918,43 +2029,52 @@ static bool load_local_campus_image(const String &path)
 static void startCampusNews()
 {
     is_campus_news_active = true;
-    
-    if (lvgl_port_lock(200)) {
-        ui_chat_set_campus_news_status("Dang doc anh tu USB/SD...");
-        lvgl_port_unlock();
-    }
-
     campus_image_count = 0;
     current_campus_image_idx = 0;
-
-    if (!init_sd_card()) {
-        is_campus_news_active = false;
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_campus_news_status("ERR: khong khoi tao duoc USB/SD");
-            lvgl_port_unlock();
-        }
-        return;
-    }
-
-    scan_campus_images_from_dir("/campus");
-    scan_campus_images_from_dir("/images");
-    scan_campus_images_from_dir("/");
-
-    if (campus_image_count == 0) {
-        is_campus_news_active = false;
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_campus_news_status("Khong tim thay JPG/JPEG\nDat anh vao /campus hoac /images");
-            lvgl_port_unlock();
-        }
-        return;
-    }
     
     if (lvgl_port_lock(200)) {
-        ui_chat_set_campus_news_status("");
+        ui_chat_set_campus_news_status("Dang tai danh sach anh...");
         lvgl_port_unlock();
     }
 
-    last_banner_change_ms = 0;
+    String body = httpGet("/api/v1/campus-images");
+    if (body.length() > 0) {
+        int pos = 0;
+        while (campus_image_count < MAX_CAMPUS_IMAGES) {
+            String url = extractJsonStringFrom(body, pos, "url", &pos);
+            if (url.length() == 0) {
+                break;
+            }
+            campus_image_paths[campus_image_count++] = url;
+            Serial.printf("Campus image list[%u] = %s\n", (unsigned)campus_image_count - 1, url.c_str());
+        }
+    }
+
+    if (campus_image_count > 0) {
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("Dang tai anh tu server...");
+            lvgl_port_unlock();
+        }
+        if (!download_image(campus_image_paths[0])) {
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_campus_news_status("Loi tai anh. Chuan bi anh khac...");
+                lvgl_port_unlock();
+            }
+        }
+        last_banner_change_ms = millis();
+    } else {
+        String fallback_url = String(SERVER_BASE_URL) + "/api/v1/campus-image";
+        if (lvgl_port_lock(200)) {
+            ui_chat_set_campus_news_status("Dang tai anh mac dinh...");
+            lvgl_port_unlock();
+        }
+        if (!download_image(fallback_url)) {
+            if (lvgl_port_lock(200)) {
+                ui_chat_set_campus_news_status("Khong the tai anh hoac server chua co anh");
+                lvgl_port_unlock();
+            }
+        }
+    }
 }
 
 static void handle_campus_news()
@@ -2298,21 +2418,12 @@ void loop()
         startCampusNews();
     }
     
-    if (is_campus_news_active) {
-        uint32_t now = millis();
-        if (last_banner_change_ms == 0 || (now - last_banner_change_ms > 5000)) {
-            last_banner_change_ms = now;
-            if (campus_image_count > 0) {
-                if (lvgl_port_lock(50)) {
-                    ui_chat_set_campus_news_status("");
-                    lvgl_port_unlock();
-                }
-                String path = campus_image_paths[current_campus_image_idx];
-                if (!load_local_campus_image(path)) {
-                    Serial.println("Campus local image load failed; see Serial log.");
-                }
-                current_campus_image_idx = (current_campus_image_idx + 1) % campus_image_count;
-            }
+    if (is_campus_news_active && campus_image_count > 1) {
+        if (millis() - last_banner_change_ms > 10000) { // Cycle every 10 seconds
+            current_campus_image_idx = (current_campus_image_idx + 1) % campus_image_count;
+            Serial.printf("Cycling campus image to index %d: %s\n", (int)current_campus_image_idx, campus_image_paths[current_campus_image_idx].c_str());
+            download_image(campus_image_paths[current_campus_image_idx]);
+            last_banner_change_ms = millis();
         }
     }
 

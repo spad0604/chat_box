@@ -1213,12 +1213,7 @@ void ui_chat_hide_campus_news()
 void ui_chat_set_campus_news_status(const char *status)
 {
     if (news_status_label) {
-        if (status && strlen(status) > 0) {
-            lv_label_set_text(news_status_label, status);
-            lv_obj_clear_flag(news_status_label, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(news_status_label, LV_OBJ_FLAG_HIDDEN);
-        }
+        lv_obj_add_flag(news_status_label, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
