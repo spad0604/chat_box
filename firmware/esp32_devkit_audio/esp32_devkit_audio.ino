@@ -32,6 +32,10 @@ static const int SPK_BCLK = 27;
 // Speaker volume. Increase later if stable: 2.0f, 2.5f, 3.0f.
 #define VOLUME_GAIN 1.5f
 
+// Volume control potentiometer pin
+static const int VOL_POT_PIN = 33;
+static float g_vol_mult = 1.0f;
+
 // Smaller chunks reduce instantaneous current.
 #define PCM_FRAMES_PER_CHUNK 128
 #define MIC_FRAMES_PER_CHUNK 160
@@ -76,7 +80,7 @@ static int16_t amplifySampleRamp(int16_t input, uint32_t frameIndex) {
     ramp = (float)frameIndex / (float)rampFrames;
   }
 
-  int32_t value = (int32_t)((float)input * VOLUME_GAIN * ramp);
+  int32_t value = (int32_t)((float)input * VOLUME_GAIN * ramp * g_vol_mult);
   if (value > 32767) value = 32767;
   if (value < -32768) value = -32768;
   return (int16_t)value;
@@ -731,6 +735,9 @@ void setup() {
   Serial.begin(USB_DEBUG_BAUD);
   delay(700);
   Serial.setTimeout(20);
+
+  // Read volume only once at startup to avoid WiFi/I2S conflicts
+  g_vol_mult = (float)analogRead(VOL_POT_PIN) / 4095.0f;
 
   Serial.println();
   Serial.println("Audio board stable build: speaker + lazy mic");

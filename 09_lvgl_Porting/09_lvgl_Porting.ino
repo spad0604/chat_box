@@ -742,7 +742,22 @@ static String httpPost(const char *path, const String &content_type, const uint8
     client.print("\r\nContent-Length: ");
     client.print(body_len);
     client.print("\r\n\r\n");
-    client.write(body, body_len);
+
+    size_t sent = 0;
+    while (sent < body_len) {
+        size_t chunk = body_len - sent;
+        if (chunk > 4096) {
+            chunk = 4096;
+        }
+        size_t written = client.write(body + sent, chunk);
+        if (written == 0) {
+            Serial.printf("HTTP body write stalled at %u/%u\n", (unsigned)sent, (unsigned)body_len);
+            client.stop();
+            return "";
+        }
+        sent += written;
+        delay(1);
+    }
 
     int status = 0;
     String response = readHttpResponse(client, &status);
@@ -797,7 +812,12 @@ static void makeWavHeader(uint8_t *header, uint32_t pcm_bytes)
 
 static String postVoiceWav()
 {
-    if (!ensureWiFi() || pcm_len == 0) {
+    if (!ensureWiFi()) {
+        Serial.println("Voice upload skipped: WiFi is not connected");
+        return "";
+    }
+    if (pcm_len == 0) {
+        Serial.println("Voice upload skipped: pcm_len is 0");
         return "";
     }
 
@@ -858,6 +878,16 @@ static void handleChatResponse(const String &body)
     ui_add("assistant", reply);
     playAudioUrl(audio_url);
     ui_status("Online");
+}
+
+static void handleVoiceChatResponse(const String &body)
+{
+    if (body.length() == 0) {
+        ui_add("assistant", "Khong upload/xu ly duoc audio. Text chat van co the hoat dong.");
+        ui_status("Error");
+        return;
+    }
+    handleChatResponse(body);
 }
 
 static void sendTextToServer(const String &text)
@@ -2069,6 +2099,73 @@ static void handle_video_close()
     ui_chat_hide_video_player();
 }
 
+enum AudioUartParseState { UART_LINE, UART_LEN0, UART_LEN1, UART_PAYLOAD };
+static AudioUartParseState audio_uart_state = UART_LINE;
+static String audio_uart_line;
+static uint16_t audio_frame_len = 0;
+static uint16_t audio_frame_pos = 0;
+static uint8_t audio_magic_pos = 0;
+static const uint8_t audio_magic[] = {'A', 'U', 'D', '0'};
+
+static void pumpAudioSerial(uint32_t duration_ms = 0)
+{
+    uint32_t start = millis();
+    do {
+        while (AudioSerial.available()) {
+            uint8_t b = AudioSerial.read();
+            if (audio_uart_state == UART_LINE) {
+                if (b == audio_magic[audio_magic_pos]) {
+                    audio_magic_pos++;
+                    if (audio_magic_pos == sizeof(audio_magic)) {
+                        audio_uart_line = "";
+                        audio_frame_len = 0;
+                        audio_uart_state = UART_LEN0;
+                        audio_magic_pos = 0;
+                    }
+                } else {
+                    audio_magic_pos = 0;
+                    if (b == '\n') {
+                        audio_uart_line.trim();
+                        if (audio_uart_line.length() > 0) {
+                            Serial.print("Audio board: ");
+                            Serial.println(audio_uart_line);
+                            if (audio_uart_line == "OK PLAY_DONE" || audio_uart_line == "OK PLAY_URL_DONE") {
+                                ui_status("Online");
+                            }
+                        }
+                        audio_uart_line = "";
+                    } else if (b != '\r' && audio_uart_line.length() < 80) {
+                        audio_uart_line += (char)b;
+                    }
+                }
+            } else if (audio_uart_state == UART_LEN0) {
+                audio_frame_len = b;
+                audio_uart_state = UART_LEN1;
+            } else if (audio_uart_state == UART_LEN1) {
+                audio_frame_len |= ((uint16_t)b << 8);
+                audio_frame_pos = 0;
+                if (audio_frame_len == 0 || audio_frame_len > 1024) {
+                    audio_uart_state = UART_LINE;
+                } else {
+                    audio_uart_state = UART_PAYLOAD;
+                }
+            } else if (audio_uart_state == UART_PAYLOAD) {
+                if (recording && pcm_len < MAX_PCM_BYTES) {
+                    pcm_buffer[pcm_len++] = b;
+                }
+                audio_frame_pos++;
+                if (audio_frame_pos >= audio_frame_len) {
+                    audio_uart_state = UART_LINE;
+                }
+            }
+        }
+        if (duration_ms == 0) {
+            break;
+        }
+        delay(1);
+    } while (millis() - start < duration_ms);
+}
+
 
 
 void setup()
@@ -2219,61 +2316,7 @@ void loop()
         }
     }
 
-    static enum { UART_LINE, UART_LEN0, UART_LEN1, UART_PAYLOAD } uart_state = UART_LINE;
-    static String uart_line;
-    static uint16_t frame_len = 0;
-    static uint16_t frame_pos = 0;
-    static uint8_t magic_pos = 0;
-    static const uint8_t magic[] = {'A', 'U', 'D', '0'};
-
-    while (AudioSerial.available()) {
-        uint8_t b = AudioSerial.read();
-        if (uart_state == UART_LINE) {
-            if (b == magic[magic_pos]) {
-                magic_pos++;
-                if (magic_pos == sizeof(magic)) {
-                    uart_line = "";
-                    frame_len = 0;
-                    uart_state = UART_LEN0;
-                    magic_pos = 0;
-                }
-            } else {
-                magic_pos = 0;
-                if (b == '\n') {
-                    uart_line.trim();
-                    if (uart_line.length() > 0) {
-                        Serial.print("Audio board: ");
-                        Serial.println(uart_line);
-                        if (uart_line == "OK PLAY_DONE" || uart_line == "OK PLAY_URL_DONE") {
-                            ui_status("Online");
-                        }
-                    }
-                    uart_line = "";
-                } else if (b != '\r' && uart_line.length() < 80) {
-                    uart_line += (char)b;
-                }
-            }
-        } else if (uart_state == UART_LEN0) {
-            frame_len = b;
-            uart_state = UART_LEN1;
-        } else if (uart_state == UART_LEN1) {
-            frame_len |= ((uint16_t)b << 8);
-            frame_pos = 0;
-            if (frame_len == 0 || frame_len > 1024) {
-                uart_state = UART_LINE;
-            } else {
-                uart_state = UART_PAYLOAD;
-            }
-        } else if (uart_state == UART_PAYLOAD) {
-            if (recording && pcm_len < MAX_PCM_BYTES) {
-                pcm_buffer[pcm_len++] = b;
-            }
-            frame_pos++;
-            if (frame_pos >= frame_len) {
-                uart_state = UART_LINE;
-            }
-        }
-    }
+    pumpAudioSerial();
 
     if (Serial.available()) {
         String line = Serial.readStringUntil('\n');
@@ -2306,12 +2349,18 @@ void loop()
             ui_status("Recording...");
             Serial.println("REC_START sent");
         } else if (!should_record && recording) {
-            recording = false;
             AudioSerial.print("REC_STOP\n");
             Serial.println("[HMI UART TX] REC_STOP");
             ui_status("Uploading...");
+            pumpAudioSerial(250);
+            recording = false;
             Serial.printf("REC_STOP sent, pcm=%u\n", (unsigned)pcm_len);
-            handleChatResponse(postVoiceWav());
+            if (pcm_len == 0) {
+                ui_add("assistant", "Khong thu duoc audio tu mic. Kiem tra firmware devkit audio/UART.");
+                ui_status("Error");
+            } else {
+                handleVoiceChatResponse(postVoiceWav());
+            }
         }
     }
 
