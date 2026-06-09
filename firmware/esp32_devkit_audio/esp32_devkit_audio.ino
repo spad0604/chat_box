@@ -1,7 +1,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <driver/i2s.h>
+#include <driver/adc.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_heap_caps.h>
+#include <FS.h>
+#include <LittleFS.h>
 
 // ===================== USER CONFIG =====================
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
@@ -23,18 +30,38 @@ static const int SPK_DIN = 25;
 static const int SPK_LRC = 26;
 static const int SPK_BCLK = 27;
 
-// If your MAX98357A SD/EN pin is connected to ESP32, uncomment and set the pin.
-// #define AMP_SD_PIN 33
+// If your MAX98357A SD/EN pin is connected to ESP32, use another pin, NOT GPIO33.
+// GPIO33 is used for the volume potentiometer ADC. Example:
+// #define AMP_SD_PIN 13
 
 #define SPEAKER_SAMPLE_RATE 16000
 #define MIC_SAMPLE_RATE     16000
 
-// Speaker volume. Increase later if stable: 2.0f, 2.5f, 3.0f.
-#define VOLUME_GAIN 1.5f
+// GPIO33 potentiometer volume. Do NOT use GPIO33 as MAX98357A SD/EN.
+// 5 stable steps based on ADC raw value:
+//   0..999      -> step 0, mute
+//   1000..1999  -> step 1
+//   2000..2999  -> step 2
+//   3000..3999  -> step 3
+//   4000+       -> step 4
+static const int VOLUME_ADC_PIN = 33;
+#define VOLUME_ADC_READ_INTERVAL_MS 250
+#define VOLUME_ADC_HYSTERESIS      120
+static const uint16_t VOLUME_GAIN_PERMILLE[5] = {0, 250, 500, 750, 1000};
+static volatile uint16_t currentVolumeGainPermille = 1000;
+static uint8_t currentVolumeStep = 4;
+static uint32_t lastVolumeReadMs = 0;
 
-// Smaller chunks reduce instantaneous current.
-#define PCM_FRAMES_PER_CHUNK 128
+// Larger chunks reduce WiFi/I2S scheduling jitter. 1024 frames = about 64 ms at 16 kHz.
+#define PCM_FRAMES_PER_CHUNK 1024
 #define MIC_FRAMES_PER_CHUNK 160
+
+// Ring buffer between HTTP download and I2S playback.
+// Keep this on heap, not static DRAM, because ESP32 DevKit V1 has limited .dram0.bss.
+// 48 KB is about 1.5 seconds of 16 kHz 16-bit mono output.
+#define AUDIO_RING_BYTES      (48 * 1024)
+#define AUDIO_PREBUFFER_BYTES (32 * 1024)
+#define AUDIO_TASK_STACK      3072
 
 // Keep speaker on I2S0 because your speaker-only test is stable with this.
 static const i2s_port_t I2S_SPK_PORT = I2S_NUM_0;
@@ -44,6 +71,7 @@ static String hmi_line;
 static bool mic_installed = false;
 static bool recording_enabled = false;
 static bool speaker_installed = false;
+static volatile bool speaker_playing = false;
 
 // Global buffers to avoid stack pressure.
 static int16_t inputBuffer[PCM_FRAMES_PER_CHUNK * 2];
@@ -51,6 +79,20 @@ static int16_t outputBuffer[PCM_FRAMES_PER_CHUNK * 2];
 static int16_t silenceBuffer[PCM_FRAMES_PER_CHUNK * 2];
 static int32_t micRawBuffer[MIC_FRAMES_PER_CHUNK];
 static int16_t micPcmBuffer[MIC_FRAMES_PER_CHUNK];
+
+// Audio playback ring buffer. Single producer: HTTP reader. Single consumer: I2S task.
+// Do not allocate this statically, otherwise .dram0.bss can overflow on ESP32.
+static uint8_t *audioRing = nullptr;
+static uint8_t audioTaskBuffer[PCM_FRAMES_PER_CHUNK * sizeof(int16_t)];
+static SemaphoreHandle_t audioRingMutex = nullptr;
+static TaskHandle_t audioTaskHandle = nullptr;
+static size_t audioRingHead = 0;
+static size_t audioRingTail = 0;
+static size_t audioRingFillBytes = 0;
+static volatile bool audioPlaybackActive = false;
+static volatile bool audioPlaybackStopping = false;
+static volatile bool audioPlaybackFinished = true;
+static volatile uint32_t audioUnderruns = 0;
 
 struct WavInfo {
   uint32_t sampleRate = 0;
@@ -70,14 +112,68 @@ static inline uint32_t readLE32(const uint8_t *p) {
          ((uint32_t)p[3] << 24);
 }
 
-static int16_t amplifySampleRamp(int16_t input, uint32_t frameIndex) {
-  const uint32_t rampFrames = SPEAKER_SAMPLE_RATE / 4; // 0.25s
-  float ramp = 1.0f;
-  if (frameIndex < rampFrames) {
-    ramp = (float)frameIndex / (float)rampFrames;
+static uint8_t classifyVolumeAdc(uint16_t adc, uint8_t previousLevel) {
+  // Hysteresis prevents volume step flapping near thresholds.
+  switch (previousLevel) {
+    case 0:
+      return (adc > 1000 + VOLUME_ADC_HYSTERESIS) ? 1 : 0;
+    case 1:
+      if (adc < 1000 - VOLUME_ADC_HYSTERESIS) return 0;
+      if (adc > 2000 + VOLUME_ADC_HYSTERESIS) return 2;
+      return 1;
+    case 2:
+      if (adc < 2000 - VOLUME_ADC_HYSTERESIS) return 1;
+      if (adc > 3000 + VOLUME_ADC_HYSTERESIS) return 3;
+      return 2;
+    case 3:
+      if (adc < 3000 - VOLUME_ADC_HYSTERESIS) return 2;
+      if (adc > 4000 + VOLUME_ADC_HYSTERESIS) return 4;
+      return 3;
+    default:
+      return (adc < 4000 - VOLUME_ADC_HYSTERESIS) ? 3 : 4;
+  }
+}
+
+static void updateVolumeStep(bool forceLog = false) {
+  uint32_t now = millis();
+  if (!forceLog && now - lastVolumeReadMs < VOLUME_ADC_READ_INTERVAL_MS) return;
+  lastVolumeReadMs = now;
+
+  // Use legacy ADC1 API to avoid Arduino ESP32 ADC driver_ng conflict.
+  uint32_t sum = 0;
+  for (int i = 0; i < 4; i++) {
+    int raw = adc1_get_raw(ADC1_CHANNEL_5); // GPIO33 = ADC1_CH5
+    if (raw < 0) raw = 0;
+    if (raw > 4095) raw = 4095;
+    sum += (uint16_t)raw;
+    delayMicroseconds(120);
   }
 
-  int32_t value = (int32_t)((float)input * VOLUME_GAIN * ramp);
+  uint16_t adc = (uint16_t)(sum / 4);
+  uint8_t oldLevel = currentVolumeStep;
+  uint8_t newLevel = classifyVolumeAdc(adc, oldLevel);
+
+  if (forceLog || newLevel != oldLevel) {
+    currentVolumeStep = newLevel;
+    currentVolumeGainPermille = VOLUME_GAIN_PERMILLE[newLevel];
+    Serial.printf("Volume step=%u adc=%u gain=%u/1000\n",
+                  (unsigned)newLevel,
+                  (unsigned)adc,
+                  (unsigned)currentVolumeGainPermille);
+  }
+}
+
+static int16_t amplifySampleRamp(int16_t input, uint32_t frameIndex) {
+  const uint32_t rampFrames = SPEAKER_SAMPLE_RATE / 4; // 0.25s
+  uint32_t rampPermille = 1000;
+  if (frameIndex < rampFrames) {
+    rampPermille = (frameIndex * 1000UL) / rampFrames;
+  }
+
+  uint16_t gainPermille = currentVolumeGainPermille;
+  int32_t value = (int32_t)input;
+  value = (value * (int32_t)gainPermille) / 1000;
+  value = (value * (int32_t)rampPermille) / 1000;
   if (value > 32767) value = 32767;
   if (value < -32768) value = -32768;
   return (int16_t)value;
@@ -304,10 +400,10 @@ static bool setupSpeaker() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SPEAKER_SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
+    .dma_buf_count = 12,
     .dma_buf_len = 512,
     .use_apll = false,
     .tx_desc_auto_clear = true,
@@ -401,6 +497,209 @@ static void uninstallMic() {
   Serial.println("Mic uninstalled and pins high-Z");
 }
 
+
+static bool audioRingInit() {
+  if (audioRing == nullptr) {
+    audioRing = (uint8_t *)heap_caps_malloc(AUDIO_RING_BYTES, MALLOC_CAP_8BIT);
+    if (audioRing == nullptr) {
+      Serial.printf("Audio ring malloc failed: %u bytes, free heap=%u\n",
+                    (unsigned)AUDIO_RING_BYTES,
+                    (unsigned)ESP.getFreeHeap());
+      return false;
+    }
+    Serial.printf("Audio ring allocated: %u bytes, free heap=%u\n",
+                  (unsigned)AUDIO_RING_BYTES,
+                  (unsigned)ESP.getFreeHeap());
+  }
+
+  if (audioRingMutex == nullptr) {
+    audioRingMutex = xSemaphoreCreateMutex();
+    if (audioRingMutex == nullptr) {
+      Serial.println("Audio ring mutex create failed");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static size_t audioRingFill() {
+  size_t fill = 0;
+  if (!audioRingInit()) return fill;
+  if (xSemaphoreTake(audioRingMutex, portMAX_DELAY) == pdTRUE) {
+    fill = audioRingFillBytes;
+    xSemaphoreGive(audioRingMutex);
+  }
+  return fill;
+}
+
+static void audioRingClear() {
+  if (!audioRingInit()) return;
+  if (xSemaphoreTake(audioRingMutex, portMAX_DELAY) == pdTRUE) {
+    audioRingHead = 0;
+    audioRingTail = 0;
+    audioRingFillBytes = 0;
+    xSemaphoreGive(audioRingMutex);
+  }
+}
+
+static size_t audioRingWriteSome(const uint8_t *data, size_t len) {
+  size_t written = 0;
+  if (!audioRingInit()) return 0;
+
+  if (xSemaphoreTake(audioRingMutex, portMAX_DELAY) != pdTRUE) return 0;
+
+  size_t freeBytes = AUDIO_RING_BYTES - audioRingFillBytes;
+  size_t toWrite = len < freeBytes ? len : freeBytes;
+
+  while (written < toWrite) {
+    size_t contiguous = AUDIO_RING_BYTES - audioRingHead;
+    size_t n = toWrite - written;
+    if (n > contiguous) n = contiguous;
+
+    memcpy(audioRing + audioRingHead, data + written, n);
+    audioRingHead = (audioRingHead + n) % AUDIO_RING_BYTES;
+    audioRingFillBytes += n;
+    written += n;
+  }
+
+  xSemaphoreGive(audioRingMutex);
+  return written;
+}
+
+static bool audioRingWriteBlocking(const uint8_t *data, size_t len, uint32_t timeoutMs) {
+  size_t total = 0;
+  uint32_t start = millis();
+
+  while (total < len) {
+    size_t n = audioRingWriteSome(data + total, len - total);
+    if (n > 0) {
+      total += n;
+      continue;
+    }
+
+    if (timeoutMs > 0 && millis() - start > timeoutMs) {
+      return false;
+    }
+
+    delay(1);
+  }
+
+  return true;
+}
+
+static size_t audioRingReadSome(uint8_t *data, size_t maxLen) {
+  size_t readBytes = 0;
+  if (!audioRingInit()) return 0;
+
+  if (xSemaphoreTake(audioRingMutex, portMAX_DELAY) != pdTRUE) return 0;
+
+  size_t toRead = maxLen < audioRingFillBytes ? maxLen : audioRingFillBytes;
+
+  while (readBytes < toRead) {
+    size_t contiguous = AUDIO_RING_BYTES - audioRingTail;
+    size_t n = toRead - readBytes;
+    if (n > contiguous) n = contiguous;
+
+    memcpy(data + readBytes, audioRing + audioRingTail, n);
+    audioRingTail = (audioRingTail + n) % AUDIO_RING_BYTES;
+    audioRingFillBytes -= n;
+    readBytes += n;
+  }
+
+  xSemaphoreGive(audioRingMutex);
+  return readBytes;
+}
+
+static void audioPlaybackTask(void *param) {
+  (void)param;
+
+  for (;;) {
+    if (!audioPlaybackActive) {
+      delay(2);
+      continue;
+    }
+
+    size_t n = audioRingReadSome(audioTaskBuffer, sizeof(audioTaskBuffer));
+
+    if (n == 0) {
+      if (audioPlaybackStopping) {
+        audioPlaybackActive = false;
+        audioPlaybackFinished = true;
+        continue;
+      }
+
+      // Network reader has not produced data in time. Write a short silence block
+      // instead of letting I2S starve hard/pop. Count it for debugging.
+      memset(audioTaskBuffer, 0, sizeof(audioTaskBuffer));
+      n = sizeof(audioTaskBuffer);
+      audioUnderruns++;
+    }
+
+    // I2S mono 16-bit requires a multiple of 2 bytes.
+    n = (n / 2) * 2;
+    if (n == 0) {
+      delay(1);
+      continue;
+    }
+
+    size_t bytesWritten = 0;
+    esp_err_t err = i2s_write(I2S_SPK_PORT,
+                              audioTaskBuffer,
+                              n,
+                              &bytesWritten,
+                              pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || bytesWritten == 0) {
+      Serial.printf("audio task i2s_write failed: %s written=%u\n",
+                    esp_err_to_name(err),
+                    (unsigned)bytesWritten);
+      audioPlaybackActive = false;
+      audioPlaybackFinished = true;
+    }
+
+    delay(0);
+  }
+}
+
+static bool ensureAudioPlaybackTask() {
+  if (!audioRingInit()) return false;
+
+  if (audioTaskHandle != nullptr) return true;
+
+  BaseType_t ok = xTaskCreatePinnedToCore(audioPlaybackTask,
+                                          "audio_play",
+                                          AUDIO_TASK_STACK,
+                                          nullptr,
+                                          5,
+                                          &audioTaskHandle,
+                                          1);
+  if (ok != pdPASS) {
+    Serial.println("Cannot create audio playback task");
+    audioTaskHandle = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+static void startBufferedPlayback() {
+  if (!audioPlaybackActive) {
+    audioPlaybackFinished = false;
+    audioPlaybackStopping = false;
+    audioPlaybackActive = true;
+  }
+}
+
+static void stopBufferedPlaybackAndWait(uint32_t timeoutMs) {
+  audioPlaybackStopping = true;
+  uint32_t start = millis();
+  while (!audioPlaybackFinished && millis() - start < timeoutMs) {
+    delay(5);
+  }
+  audioPlaybackActive = false;
+  audioPlaybackStopping = false;
+}
+
 static void writeSilenceMs(uint32_t ms) {
   if (!setupSpeaker()) {
     Serial.println("Cannot write silence: speaker init failed");
@@ -454,7 +753,183 @@ static void connectWiFi() {
   }
 }
 
+
+static bool saveWavPcmToLittleFS(WiFiClient &client, uint32_t dataSize, const char *path) {
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed");
+    return false;
+  }
+
+  if (LittleFS.exists(path)) {
+    LittleFS.remove(path);
+  }
+
+  File f = LittleFS.open(path, "w");
+  if (!f) {
+    Serial.println("Cannot open audio cache file for write");
+    return false;
+  }
+
+  uint8_t temp[2048];
+  uint32_t remaining = dataSize;
+  uint32_t writtenTotal = 0;
+  uint32_t lastLog = millis();
+
+  Serial.println("Downloading WAV PCM data to LittleFS cache...");
+
+  while (remaining > 0) {
+    size_t want = remaining > sizeof(temp) ? sizeof(temp) : remaining;
+    int n = client.readBytes(temp, want);
+
+    if (n <= 0) {
+      if (!client.connected()) break;
+      delay(1);
+      continue;
+    }
+
+    size_t w = f.write(temp, (size_t)n);
+    if (w != (size_t)n) {
+      Serial.printf("LittleFS write failed: wanted=%u wrote=%u\n", (unsigned)n, (unsigned)w);
+      f.close();
+      return false;
+    }
+
+    remaining -= (uint32_t)n;
+    writtenTotal += (uint32_t)n;
+
+    if (millis() - lastLog > 1000) {
+      lastLog = millis();
+      Serial.printf("downloading... remaining=%lu written=%lu heap=%u\n",
+                    (unsigned long)remaining,
+                    (unsigned long)writtenTotal,
+                    (unsigned)ESP.getFreeHeap());
+    }
+
+    delay(0);
+  }
+
+  f.close();
+
+  if (remaining != 0) {
+    Serial.printf("Download incomplete: written=%lu remaining=%lu\n",
+                  (unsigned long)writtenTotal,
+                  (unsigned long)remaining);
+    return false;
+  }
+
+  Serial.printf("Download done: %lu bytes cached\n", (unsigned long)writtenTotal);
+  return true;
+}
+
+static bool playCachedPcmFromLittleFS(const char *path, const WavInfo &wav) {
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    Serial.println("Cannot open audio cache file for read");
+    return false;
+  }
+
+  if (!setupSpeaker()) {
+    Serial.println("Speaker init failed");
+    f.close();
+    return false;
+  }
+
+#ifdef AMP_SD_PIN
+  digitalWrite(AMP_SD_PIN, HIGH);
+  delay(50);
+#endif
+
+  i2s_zero_dma_buffer(I2S_SPK_PORT);
+  writeSilenceMs(80);
+
+  const size_t bytesPerInputFrame = wav.channels * sizeof(int16_t);
+  uint32_t remaining = wav.dataSize;
+  uint32_t frameIndex = 0;
+  uint32_t totalWritten = 0;
+  uint32_t lastLog = millis();
+
+  Serial.println("Start LittleFS local playback...");
+  updateVolumeStep(true);
+
+  while (remaining > 0) {
+    updateVolumeStep(false);
+    size_t want = PCM_FRAMES_PER_CHUNK * bytesPerInputFrame;
+    if (remaining < want) want = remaining;
+    want = (want / bytesPerInputFrame) * bytesPerInputFrame;
+    if (want == 0) break;
+
+    int bytesRead = f.read((uint8_t *)inputBuffer, want);
+    if (bytesRead <= 0) {
+      Serial.println("Audio cache read ended early");
+      break;
+    }
+
+    remaining -= (uint32_t)bytesRead;
+    int frames = bytesRead / (int)bytesPerInputFrame;
+    int outIndex = 0;
+
+    if (wav.channels == 1) {
+      for (int i = 0; i < frames; i++) {
+        outputBuffer[outIndex++] = amplifySampleRamp(inputBuffer[i], frameIndex++);
+      }
+    } else {
+      for (int i = 0; i < frames; i++) {
+        int32_t mixed = ((int32_t)inputBuffer[i * 2] + (int32_t)inputBuffer[i * 2 + 1]) / 2;
+        outputBuffer[outIndex++] = amplifySampleRamp((int16_t)mixed, frameIndex++);
+      }
+    }
+
+    size_t bytesWritten = 0;
+    esp_err_t err = i2s_write(I2S_SPK_PORT,
+                              outputBuffer,
+                              outIndex * sizeof(int16_t),
+                              &bytesWritten,
+                              pdMS_TO_TICKS(1000));
+
+    if (err != ESP_OK || bytesWritten == 0) {
+      Serial.printf("i2s_write failed: %s written=%u remaining=%lu\n",
+                    esp_err_to_name(err),
+                    (unsigned)bytesWritten,
+                    (unsigned long)remaining);
+      f.close();
+      return false;
+    }
+
+    totalWritten += (uint32_t)bytesWritten;
+
+    if (millis() - lastLog > 2000) {
+      lastLog = millis();
+      Serial.printf("playing local... remaining=%lu written=%lu heap=%u\n",
+                    (unsigned long)remaining,
+                    (unsigned long)totalWritten,
+                    (unsigned)ESP.getFreeHeap());
+    }
+
+    delay(0);
+  }
+
+  f.close();
+
+  writeSilenceMs(300);
+  i2s_zero_dma_buffer(I2S_SPK_PORT);
+
+#ifdef AMP_SD_PIN
+  digitalWrite(AMP_SD_PIN, HIGH);
+#endif
+
+  Serial.printf("LittleFS playback done, totalWritten=%lu remaining=%lu\n",
+                (unsigned long)totalWritten,
+                (unsigned long)remaining);
+
+  return remaining == 0;
+}
+
 static bool playWavFromUrl(const String &audioUrl) {
+  if (speaker_playing) {
+    Serial.println("Playback already active");
+    return false;
+  }
+  speaker_playing = true;
   String url = absoluteAudioUrl(audioUrl);
   String host, path;
   uint16_t port = 80;
@@ -476,7 +951,7 @@ static bool playWavFromUrl(const String &audioUrl) {
   Serial.println(port);
 
   WiFiClient client;
-  client.setTimeout(5000);
+  client.setTimeout(8000);
 
   if (!client.connect(host.c_str(), port)) {
     Serial.println("TCP connect failed");
@@ -516,107 +991,24 @@ static bool playWavFromUrl(const String &audioUrl) {
     return false;
   }
 
-  // Keep speaker I2S installed across plays. Reinstalling/uninstalling I2S0 every
-  // playback can leave MAX98357A with stale/missing clocks on the next play.
-  if (!setupSpeaker()) {
-    Serial.println("Speaker init failed");
-    client.stop();
+  static const char *CACHE_PATH = "/reply_audio.pcm";
+  bool saved = saveWavPcmToLittleFS(client, wav.dataSize, CACHE_PATH);
+  client.stop();
+
+  if (!saved) {
+    Serial.println("PLAY_URL failed while caching audio");
     return false;
   }
 
-#ifdef AMP_SD_PIN
-  digitalWrite(AMP_SD_PIN, HIGH);
-  delay(50);
-#endif
+  bool played = playCachedPcmFromLittleFS(CACHE_PATH, wav);
 
-  i2s_zero_dma_buffer(I2S_SPK_PORT);
-  writeSilenceMs(80);
-
-  Serial.println("Start playing audio data...");
-
-  const size_t bytesPerInputFrame = wav.channels * sizeof(int16_t);
-  uint32_t remaining = wav.dataSize;
-  uint32_t frameIndex = 0;
-  uint32_t totalWritten = 0;
-  uint32_t lastLog = millis();
-
-  while (remaining > 0) {
-    size_t want = sizeof(inputBuffer);
-    if (remaining < want) want = remaining;
-    want = (want / bytesPerInputFrame) * bytesPerInputFrame;
-    if (want == 0) break;
-
-    int bytesRead = client.readBytes((uint8_t *)inputBuffer, want);
-    if (bytesRead <= 0) {
-      if (!client.connected()) break;
-      delay(1);
-      continue;
-    }
-
-    remaining -= (uint32_t)bytesRead;
-    int frames = bytesRead / (int)bytesPerInputFrame;
-    int outIndex = 0;
-
-    if (wav.channels == 1) {
-      for (int i = 0; i < frames; i++) {
-        int16_t s = amplifySampleRamp(inputBuffer[i], frameIndex++);
-        outputBuffer[outIndex++] = s;
-        outputBuffer[outIndex++] = s;
-      }
-    } else {
-      for (int i = 0; i < frames; i++) {
-        int16_t l = amplifySampleRamp(inputBuffer[i * 2], frameIndex);
-        int16_t r = amplifySampleRamp(inputBuffer[i * 2 + 1], frameIndex);
-        frameIndex++;
-        outputBuffer[outIndex++] = l;
-        outputBuffer[outIndex++] = r;
-      }
-    }
-
-    size_t bytesWritten = 0;
-    esp_err_t err = i2s_write(I2S_SPK_PORT,
-                              outputBuffer,
-                              outIndex * sizeof(int16_t),
-                              &bytesWritten,
-                              pdMS_TO_TICKS(1000));
-
-    if (err != ESP_OK || bytesWritten == 0) {
-      Serial.printf("i2s_write failed: %s written=%u remaining=%lu\n",
-                    esp_err_to_name(err),
-                    (unsigned)bytesWritten,
-                    (unsigned long)remaining);
-      client.stop();
-      return false;
-    }
-
-    totalWritten += (uint32_t)bytesWritten;
-
-    if (millis() - lastLog > 500) {
-      lastLog = millis();
-      Serial.printf("playing... remaining=%lu written=%lu heap=%u\n",
-                    (unsigned long)remaining,
-                    (unsigned long)totalWritten,
-                    (unsigned)ESP.getFreeHeap());
-    }
-
-    delay(0);
+  if (!played) {
+    Serial.println("PLAY_URL failed while playing cached audio");
+    return false;
   }
 
-  writeSilenceMs(300);
-  i2s_zero_dma_buffer(I2S_SPK_PORT);
-
-#ifdef AMP_SD_PIN
-  // Keep amp enabled. Pulling SD/EN low after playback can make the next playback silent
-  // if the pin or module enable state is not restored cleanly.
-  digitalWrite(AMP_SD_PIN, HIGH);
-#endif
-
-  client.stop();
-
-  Serial.printf("URL playback done, totalWritten=%lu remaining=%lu\n",
-                (unsigned long)totalWritten,
-                (unsigned long)remaining);
   HmiSerial.print("OK PLAY_DONE\n");
+  speaker_playing = false;
   return true;
 }
 
@@ -633,6 +1025,11 @@ static void sendAudioFrame(const uint8_t *data, uint16_t len) {
 
 static void startRecording() {
   Serial.println("REC_START requested");
+  if (speaker_playing) {
+    Serial.println("Reject REC_START: speaker is playing");
+    HmiSerial.print("ERR SPEAKER_BUSY\n");
+    return;
+  }
 
   if (!installMic()) {
     Serial.println("Mic init failed");
@@ -716,6 +1113,7 @@ static void playUrl(const String &url) {
 
   HmiSerial.print("OK PLAYING_URL\n");
   bool ok = playWavFromUrl(url);
+  speaker_playing = false;
   if (!ok) {
     HmiSerial.print("ERR PLAY_URL_FAILED\n");
     Serial.println("PLAY_URL failed");
@@ -771,7 +1169,7 @@ void setup() {
   Serial.setTimeout(20);
 
   Serial.println();
-  Serial.println("Audio board stable build: speaker + lazy mic");
+  Serial.println("Audio board mono buffered build: speaker + lazy mic");
   Serial.print("Reset reason: ");
   Serial.println((int)esp_reset_reason());
   Serial.print("Free heap at boot: ");
@@ -785,13 +1183,28 @@ void setup() {
   HmiSerial.begin(HMI_BAUD, SERIAL_8N1, HMI_RX, HMI_TX);
   HmiSerial.setTimeout(20);
 
+  pinMode(VOLUME_ADC_PIN, INPUT);
+  // Legacy ADC1 setup. Avoid analogRead()/analogSetPinAttenuation() to prevent driver_ng conflict.
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11); // GPIO33
+  updateVolumeStep(true);
+
   micPinsHighZ();
   Serial.println("Mic lazy mode: pins high-Z until REC_START");
+
+  if (LittleFS.begin(true)) {
+    Serial.printf("LittleFS ready: total=%u used=%u\n",
+                  (unsigned)LittleFS.totalBytes(),
+                  (unsigned)LittleFS.usedBytes());
+  } else {
+    Serial.println("LittleFS mount failed at boot");
+  }
 
   connectWiFi();
   if (!setupSpeaker()) {
     Serial.println("Speaker init failed at boot");
   }
+  ensureAudioPlaybackTask();
 
   Serial.println("Audio board ready");
   Serial.printf("USB debug baud=%lu, HMI UART RX=%d TX=%d baud=%lu\n",
@@ -804,6 +1217,8 @@ void setup() {
 }
 
 void loop() {
+  updateVolumeStep(false);
+
   if (Serial.available()) {
     String line = Serial.readStringUntil('\n');
     handleCommand(line);
