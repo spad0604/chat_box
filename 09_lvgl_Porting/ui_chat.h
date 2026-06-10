@@ -6,6 +6,7 @@
 typedef void (*ui_chat_text_cb_t)(const char *text);
 typedef void (*ui_chat_simple_cb_t)();
 typedef void (*ui_chat_history_cb_t)(uint8_t index);
+typedef void (*ui_chat_int_cb_t)(int val);
 
 void ui_chat_init();
 void ui_chat_set_send_callback(ui_chat_text_cb_t cb);
@@ -24,19 +25,12 @@ void ui_chat_set_datetime(const char *time_text, const char *date_text);
 // call the history callback with the provided index.
 void ui_chat_show_sessions(const char *const *titles, uint8_t count);
 
-typedef void (*ui_video_cb_t)();
-void ui_chat_set_video_callback(ui_video_cb_t cb);
-void ui_chat_set_video_close_callback(ui_video_cb_t cb);
-void ui_chat_show_video_player();
-void ui_chat_hide_video_player();
-lv_color_t* ui_chat_get_video_canvas_buffer();
-void ui_chat_refresh_video_canvas();
-void ui_chat_set_video_status(const char *status);
 
 void ui_chat_show_wifi_config_screen(const char *ssid, const char *ip);
 
 void ui_chat_set_campus_news_callback(ui_chat_simple_cb_t cb);
 void ui_chat_set_campus_news_close_callback(ui_chat_simple_cb_t cb);
+void ui_chat_set_campus_news_swipe_callback(ui_chat_int_cb_t cb);
 void ui_chat_show_campus_news();
 void ui_chat_hide_campus_news();
 void ui_chat_set_campus_news_status(const char *status);

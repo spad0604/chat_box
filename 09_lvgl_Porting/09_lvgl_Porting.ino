@@ -990,15 +990,6 @@ static void handle_open_history()
 }
 
 static bool sd_initialized = false;
-static bool is_playing_video = false;
-static volatile bool video_task_stop = false;
-static TaskHandle_t video_task_handle = nullptr;
-static File video_file;
-static uint8_t *video_frame_buf = nullptr;
-static size_t video_frame_buf_sz = 128 * 1024;
-static uint32_t last_frame_time_ms = 0;
-static const uint32_t frame_interval_ms = 200; // Stability first: ~5 FPS while decoding on CPU
-static const size_t video_frame_max_sz = 384 * 1024;
 
 static bool init_sd_card()
 {
@@ -1013,10 +1004,6 @@ static bool init_sd_card()
     }
 
     Serial.println("Initializing SD card...");
-    if (lvgl_port_lock(200)) {
-        ui_chat_set_video_status("SD: Initializing SPI...");
-        lvgl_port_unlock();
-    }
 
     SPI.setHwCs(false);
     pinMode(SD_MISO, INPUT_PULLUP);
@@ -1040,35 +1027,18 @@ static bool init_sd_card()
             }
             expander->digitalWrite(SD_CS_EXIO, 0); // Pull EXIO4 LOW to select SD card
             Serial.println("SD CS (EXIO4) set to LOW");
-            if (lvgl_port_lock(200)) {
-                ui_chat_set_video_status("SD: EXIO4 reset OK\nSD.begin()...");
-                lvgl_port_unlock();
-            }
         } else {
             Serial.println("Failed to get CH422G expander base!");
-            if (lvgl_port_lock(200)) {
-                ui_chat_set_video_status("SD ERR: CH422G expander NULL!\nKhong lay duoc IO Expander");
-                lvgl_port_unlock();
-            }
         }
     } else {
         Serial.println("Global board or IO expander is null!");
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("SD ERR: global_board or\nIO expander is NULL!");
-            lvgl_port_unlock();
-        }
     }
 
-    // Try multiple SPI speeds
+    // Try multiple SPI speeds: 40MHz down to 4MHz
     esp_task_wdt_reset();
-    uint32_t speeds[] = {4000000, 2000000, 1000000, 400000};
+    uint32_t speeds[] = {40000000, 20000000, 10000000, 4000000};
     for (int i = 0; i < 4; i++) {
         esp_task_wdt_reset();
-        if (lvgl_port_lock(200)) {
-            String msg = "SD.begin(CS=15, " + String(speeds[i]/1000) + "kHz)...";
-            ui_chat_set_video_status(msg.c_str());
-            lvgl_port_unlock();
-        }
         if (SD.begin(15, SPI, speeds[i])) {
             Serial.printf("SD card OK at %d Hz\n", speeds[i]);
             sd_initialized = true;
@@ -1080,54 +1050,15 @@ static bool init_sd_card()
             Serial.printf("SD card OK at %d Hz\n", speeds[i]);
             Serial.printf("SD card type: %u, size: %llu MB\n", card_type, SD.cardSize() / (1024 * 1024));
             sd_initialized = true;
-            if (lvgl_port_lock(200)) {
-                String msg = "SD OK! Speed: " + String(speeds[i]/1000) + "kHz";
-                ui_chat_set_video_status(msg.c_str());
-                lvgl_port_unlock();
-            }
             return true;
         }
         Serial.printf("SD.begin failed at %d Hz\n", speeds[i]);
     }
 
-    if (lvgl_port_lock(200)) {
-        ui_chat_set_video_status("SD FAILED tat ca toc do!\n- Kiem tra the nho FAT32\n- Cam lai the cho chat\n- Thu the nho khac");
-        lvgl_port_unlock();
-    }
     return false;
 }
 
-static String find_video_file()
-{
-    if (SD.exists("/video.mjpeg")) {
-        return "/video.mjpeg";
-    }
-    if (SD.exists("/video.mjpg")) {
-        return "/video.mjpg";
-    }
 
-    File root = SD.open("/");
-    if (!root) {
-        return "";
-    }
-
-    File file = root.openNextFile();
-    while (file) {
-        if (!file.isDirectory()) {
-            String name = file.name();
-            if (name.endsWith(".mjpeg") || name.endsWith(".mjpg") || name.endsWith(".MJPEG") || name.endsWith(".MJPG")) {
-                String path = "/" + name;
-                file.close();
-                root.close();
-                return path;
-            }
-        }
-        file.close();
-        file = root.openNextFile();
-    }
-    root.close();
-    return "";
-}
 
 struct JpgDecContext {
     const uint8_t *data;
@@ -1261,160 +1192,6 @@ static UINT jpg_outfunc(JDEC *jd, void *bitmap, JRECT *rect)
     return 1;
 }
 
-static size_t find_next_soi(File &f)
-{
-    static uint8_t buffer[2048];
-    size_t pos = f.position();
-    f.seek(pos + 2); // Skip current SOI
-
-    size_t scan_pos = pos + 2;
-    while (f.available()) {
-        int bytes_read = f.read(buffer, sizeof(buffer));
-        if (bytes_read <= 0) break;
-
-        for (int i = 0; i < bytes_read - 1; i++) {
-            if (buffer[i] == 0xFF && buffer[i+1] == 0xD8) {
-                size_t found_pos = scan_pos + i;
-                f.seek(found_pos);
-                return found_pos;
-            }
-        }
-        if (buffer[bytes_read - 1] == 0xFF) {
-            int next_byte = f.peek();
-            if (next_byte == 0xD8) {
-                size_t found_pos = scan_pos + bytes_read - 1;
-                f.seek(found_pos);
-                return found_pos;
-            }
-        }
-        scan_pos += bytes_read;
-    }
-    return f.size();
-}
-
-static void play_next_video_frame()
-{
-    if (video_task_stop) {
-        return;
-    }
-
-    if (!video_file || !video_file.available()) {
-        Serial.println("Video end reached, looping...");
-        video_file.seek(0);
-    }
-
-    size_t start_pos = video_file.position();
-    size_t next_soi_pos = find_next_soi(video_file);
-    size_t frame_sz = next_soi_pos - start_pos;
-
-    if (frame_sz < 4) {
-        video_file.seek(0);
-        return;
-    }
-
-    if (frame_sz > video_frame_max_sz) {
-        Serial.printf("Skip oversized MJPEG frame: %u bytes\n", (unsigned)frame_sz);
-        video_file.seek(next_soi_pos);
-        return;
-    }
-
-    if (frame_sz > video_frame_buf_sz) {
-        size_t new_sz = frame_sz + 16 * 1024;
-        uint8_t *new_buf = (uint8_t *)ps_realloc(video_frame_buf, new_sz);
-        if (new_buf) {
-            video_frame_buf = new_buf;
-            video_frame_buf_sz = new_sz;
-        } else {
-            Serial.println("Failed to realloc video frame buffer!");
-            return;
-        }
-    }
-
-    video_file.seek(start_pos);
-    if (video_file.read(video_frame_buf, frame_sz) != frame_sz) {
-        Serial.println("Failed to read video frame data!");
-        return;
-    }
-    video_file.seek(next_soi_pos);
-
-    if (video_task_stop) {
-        return;
-    }
-
-    JDEC jd;
-    static uint8_t *pool = nullptr;
-    if (!pool) {
-        pool = (uint8_t *)malloc(4096);
-    }
-    if (!pool) {
-        Serial.println("Failed to allocate JPEG pool!");
-        return;
-    }
-
-    lv_color_t *canvas_buf = ui_chat_get_video_canvas_buffer();
-    if (!canvas_buf) {
-        Serial.println("Video canvas buffer is NULL");
-        return;
-    }
-
-    if (!lvgl_port_lock(200)) {
-        Serial.println("Skip video frame: LVGL lock timeout");
-        return;
-    }
-
-    JpgDecContext ctx;
-    ctx.data = video_frame_buf;
-    ctx.file = nullptr;
-    ctx.size = frame_sz;
-    ctx.index = 0;
-    ctx.canvas_buf = (uint16_t *)canvas_buf;
-    ctx.canvas_width = 800;
-    ctx.canvas_height = 480;
-    ctx.blocks = 0;
-    ctx.scale = 2;
-
-    memset(canvas_buf, 0, 800 * 480 * sizeof(lv_color_t));
-    esp_task_wdt_reset();
-    Serial.printf("Video JPEG prepare: frame=%u scale=%u\n", (unsigned)frame_sz, ctx.scale);
-    JRESULT res = jd_prepare(&jd, jpg_infunc, pool, 4096, &ctx);
-    if (res == JDR_OK) {
-        Serial.printf("Video JPEG decode start: %ux%u\n", jd.width, jd.height);
-        res = jd_decomp(&jd, jpg_outfunc, ctx.scale);
-        Serial.printf("Video JPEG decode result: %d, blocks=%u\n", res, (unsigned)ctx.blocks);
-        if (res != JDR_OK) {
-            Serial.printf("JPEG decompression failed: %d\n", res);
-        }
-    } else {
-        Serial.printf("JPEG prepare failed: %d\n", res);
-    }
-
-    ui_chat_refresh_video_canvas();
-    lvgl_port_unlock();
-}
-
-static void video_player_task(void *arg)
-{
-    (void)arg;
-    Serial.println("Video task started");
-    uint32_t last_frame = millis();
-
-    while (!video_task_stop) {
-        uint32_t now = millis();
-        if (now - last_frame >= frame_interval_ms) {
-            last_frame = now;
-            play_next_video_frame();
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    if (video_file) {
-        video_file.close();
-    }
-    is_playing_video = false;
-    video_task_handle = nullptr;
-    Serial.println("Video task stopped");
-    vTaskDelete(nullptr);
-}
 
 static volatile bool pending_campus_news = false;
 static bool is_campus_news_active = false;
@@ -2085,6 +1862,15 @@ static void handle_campus_news()
     pending_campus_news = true;
 }
 
+static volatile int pending_campus_swipe_dir = 0;
+static volatile bool pending_campus_swipe = false;
+
+static void handle_campus_news_swipe(int dir)
+{
+    pending_campus_swipe_dir = dir;
+    pending_campus_swipe = true;
+}
+
 static void handle_campus_news_close()
 {
     Serial.println("Campus News close");
@@ -2092,132 +1878,6 @@ static void handle_campus_news_close()
     ui_chat_hide_campus_news();
 }
 
-static volatile bool pending_video_start = false;
-
-static void startVideoPlayer()
-{
-    if (video_task_handle) {
-        video_task_stop = true;
-        for (int i = 0; i < 100 && video_task_handle; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        if (video_task_handle) {
-            if (lvgl_port_lock(200)) {
-                ui_chat_set_video_status("Video task dang dung, thu lai sau...");
-                lvgl_port_unlock();
-            }
-            return;
-        }
-    }
-
-    if (!init_sd_card()) {
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("Loi: Khong the khoi tao the nho!\nVui long cam the nho.");
-            lvgl_port_unlock();
-        }
-        return;
-    }
-
-    if (lvgl_port_lock(200)) {
-        ui_chat_set_video_status("Dang quet tim file video...");
-        lvgl_port_unlock();
-    }
-
-    String video_path = find_video_file();
-    if (video_path.length() == 0) {
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("Khong tim thay file video (.mjpeg)!\nVui long copy video vao the nho.");
-            lvgl_port_unlock();
-        }
-        return;
-    }
-
-    Serial.print("Opening video file: ");
-    Serial.println(video_path);
-
-    video_file = SD.open(video_path, FILE_READ);
-    if (!video_file) {
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("Loi: Khong the mo file video!");
-            lvgl_port_unlock();
-        }
-        return;
-    }
-
-    uint8_t header[2];
-    if (video_file.read(header, 2) != 2 || header[0] != 0xFF || header[1] != 0xD8) {
-        video_file.close();
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("Loi: Dinh dang video khong hop le!\nYeu cau file MJPEG (Motion JPEG).");
-            lvgl_port_unlock();
-        }
-        return;
-    }
-    video_file.seek(0);
-
-    lv_color_t *canvas_buf = ui_chat_get_video_canvas_buffer();
-    if (canvas_buf) {
-        memset(canvas_buf, 0, 800 * 480 * sizeof(lv_color_t));
-    }
-
-    if (lvgl_port_lock(200)) {
-        ui_chat_set_video_status("");
-        ui_chat_refresh_video_canvas();
-        lvgl_port_unlock();
-    }
-
-    if (!video_frame_buf) {
-        video_frame_buf = (uint8_t *)ps_malloc(video_frame_buf_sz);
-    }
-    if (!video_frame_buf) {
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("Loi: Khong du PSRAM cho video buffer!");
-            lvgl_port_unlock();
-        }
-        video_file.close();
-        return;
-    }
-
-    is_playing_video = true;
-    video_task_stop = false;
-    last_frame_time_ms = millis();
-
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        video_player_task,
-        "video_player",
-        24 * 1024,
-        nullptr,
-        1,
-        &video_task_handle,
-        0
-    );
-    if (ok != pdPASS) {
-        video_task_handle = nullptr;
-        is_playing_video = false;
-        video_file.close();
-        if (lvgl_port_lock(200)) {
-            ui_chat_set_video_status("Loi: Khong tao duoc video task!");
-            lvgl_port_unlock();
-        }
-    }
-}
-
-static void handle_video_start()
-{
-    Serial.println("Video playback is disabled.");
-}
-
-static void handle_video_close()
-{
-    Serial.println("Video close request");
-    video_task_stop = true;
-    for (int i = 0; i < 100 && video_task_handle; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    is_playing_video = false;
-
-    ui_chat_hide_video_player();
-}
 
 enum AudioUartParseState { UART_LINE, UART_LEN0, UART_LEN1, UART_PAYLOAD };
 static AudioUartParseState audio_uart_state = UART_LINE;
@@ -2357,6 +2017,8 @@ void setup()
     ui_chat_set_history_callback(handle_history);
     ui_chat_set_campus_news_callback(handle_campus_news);
     ui_chat_set_campus_news_close_callback(handle_campus_news_close);
+    ui_chat_set_campus_news_swipe_callback(handle_campus_news_swipe);
+
     ui_chat_init();
 
     // Initialize a default session id at boot; a new one will be created on each "New chat".
@@ -2417,9 +2079,28 @@ void loop()
         pending_campus_news = false;
         startCampusNews();
     }
+
     
+    if (pending_campus_swipe) {
+        pending_campus_swipe = false;
+        if (is_campus_news_active && campus_image_count > 1) {
+            if (pending_campus_swipe_dir == 1) { // Left swipe -> next
+                current_campus_image_idx = (current_campus_image_idx + 1) % campus_image_count;
+            } else if (pending_campus_swipe_dir == -1) { // Right swipe -> prev
+                if (current_campus_image_idx == 0) {
+                    current_campus_image_idx = campus_image_count - 1;
+                } else {
+                    current_campus_image_idx--;
+                }
+            }
+            Serial.printf("Swipe to campus image index %d: %s\n", (int)current_campus_image_idx, campus_image_paths[current_campus_image_idx].c_str());
+            download_image(campus_image_paths[current_campus_image_idx]);
+            last_banner_change_ms = millis();
+        }
+    }
+
     if (is_campus_news_active && campus_image_count > 1) {
-        if (millis() - last_banner_change_ms > 10000) { // Cycle every 10 seconds
+        if (millis() - last_banner_change_ms > 5000) { // Cycle every 5 seconds
             current_campus_image_idx = (current_campus_image_idx + 1) % campus_image_count;
             Serial.printf("Cycling campus image to index %d: %s\n", (int)current_campus_image_idx, campus_image_paths[current_campus_image_idx].c_str());
             download_image(campus_image_paths[current_campus_image_idx]);
