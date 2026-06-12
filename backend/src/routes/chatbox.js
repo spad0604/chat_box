@@ -16,8 +16,9 @@ import { chatConfig } from '../chat/config.js';
 import {
   deleteOpenAiDocument,
   generateReply,
+  listOpenAiVectorStoreFiles,
   synthesize,
-  synthesizeWithFpt,
+  synthesizeWithViettel,
   transcribe,
   transcribeRawWithFpt,
   uploadOpenAiDocument,
@@ -299,28 +300,34 @@ router.post('/asr/fpt', upload.single('file'), async (req, res, next) => {
   }
 });
 
-router.post('/tts/fpt', async (req, res, next) => {
+router.post('/tts/viettel', handleTtsRequest);
+router.post('/tts/fpt', handleTtsRequest);
+
+async function handleTtsRequest(req, res, next) {
   try {
     const text = String(req.body?.text || '').trim();
     if (!text) {
       return res.status(400).json({ detail: 'text is required' });
     }
-    const audio = await synthesizeWithFpt(text, {
+    const audio = await synthesizeWithViettel(text, {
       voice: req.body?.voice,
       speed: req.body?.speed,
+      tts_return_option: req.body?.tts_return_option,
+      without_filter: req.body?.without_filter,
     });
     const filename = await saveReplyAudio(audio || Buffer.alloc(0));
     return res.json({
       text,
-      voice: req.body?.voice || chatConfig.fptTtsVoice,
-      speed: req.body?.speed ?? chatConfig.fptTtsSpeed,
+      voice: req.body?.voice || chatConfig.viettelTtsVoice,
+      speed: req.body?.speed ?? chatConfig.viettelTtsSpeed,
+      tts_return_option: req.body?.tts_return_option ?? chatConfig.viettelTtsReturnOption,
       audio_url: publicAudioUrl(filename),
       size: audio?.length || 0,
     });
   } catch (error) {
     next(error);
   }
-});
+}
 
 router.post('/documents/upload', upload.single('file'), async (req, res, next) => {
   try {
@@ -354,12 +361,35 @@ router.post('/documents/upload', upload.single('file'), async (req, res, next) =
 
 router.get('/documents', async (_req, res, next) => {
   try {
+    await syncOpenAiDocumentStatuses();
     const result = await query('select * from documents order by updated_at desc, id desc');
     res.json(result.rows.map(documentResponse));
   } catch (error) {
     next(error);
   }
 });
+
+async function syncOpenAiDocumentStatuses() {
+  const files = await listOpenAiVectorStoreFiles();
+  if (files.length === 0) {
+    return;
+  }
+
+  for (const file of files) {
+    if (!file.id || !file.status) {
+      continue;
+    }
+    await query(
+      `
+        update documents
+        set status = $1,
+            updated_at = now()
+        where file_id = $2 and status is distinct from $1
+      `,
+      [file.status, file.id]
+    );
+  }
+}
 
 router.put('/documents/:documentId', upload.single('file'), async (req, res, next) => {
   try {

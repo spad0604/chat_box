@@ -331,7 +331,14 @@ export const openApiSpec = {
       post: {
         tags: ['tts'],
         requestBody: jsonBody('TtsPayload'),
-        responses: { 200: { description: 'FPT TTS result' }, 400: errorResponse() },
+        responses: { 200: { description: 'Viettel TTS result (legacy FPT path)' }, 400: errorResponse() },
+      },
+    },
+    '/api/v1/tts/viettel': {
+      post: {
+        tags: ['tts'],
+        requestBody: jsonBody('TtsPayload'),
+        responses: { 200: { description: 'Viettel TTS result' }, 400: errorResponse() },
       },
     },
     '/api/v1/documents/upload': documentUploadPath('post'),

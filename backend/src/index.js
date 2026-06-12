@@ -57,7 +57,8 @@ app.use((_req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error('Unhandled error:', error);
-  res.status(500).json({ message: 'Internal server error' });
+  const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+  res.status(statusCode).json({ message: statusCode >= 500 ? 'Internal server error' : error.message });
 });
 
 async function start() {
