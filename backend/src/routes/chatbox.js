@@ -24,7 +24,14 @@ import {
   uploadOpenAiDocument,
   extractTranscript,
 } from '../chat/providers.js';
-import { ensureStorageDirs, publicAudioUrl, resolveAudioPath, saveReplyAudio } from '../chat/audioStorage.js';
+import {
+  ensureStorageDirs,
+  publicAudioUrl,
+  publicEsp32AudioUrl,
+  resolveAudioPath,
+  resolveEsp32AudioPath,
+  saveReplyAudio,
+} from '../chat/audioStorage.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
@@ -282,6 +289,18 @@ router.get('/audio/:filename', (req, res) => {
   return res.sendFile(audioPath);
 });
 
+router.get('/audio-esp32/:filename', async (req, res, next) => {
+  try {
+    const audioPath = await resolveEsp32AudioPath(req.params.filename, req.query.rate, req.query.bits);
+    if (!audioPath) {
+      return res.status(404).json({ detail: 'Audio file not found' });
+    }
+    return res.sendFile(audioPath);
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post('/asr/fpt', upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
@@ -322,6 +341,7 @@ async function handleTtsRequest(req, res, next) {
       speed: req.body?.speed ?? chatConfig.viettelTtsSpeed,
       tts_return_option: req.body?.tts_return_option ?? chatConfig.viettelTtsReturnOption,
       audio_url: publicAudioUrl(filename),
+      esp32_audio_url: publicEsp32AudioUrl(filename),
       size: audio?.length || 0,
     });
   } catch (error) {

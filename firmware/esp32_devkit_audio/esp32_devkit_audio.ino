@@ -2,7 +2,6 @@
 #include <WiFi.h>
 #include <driver/i2s.h>
 #include <driver/adc.h>
-#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -12,6 +11,10 @@
 
 // ===================== USER CONFIG =====================
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
+static const char *TEST_AUDIO_URL = "http://54.206.118.226:8000/api/v1/audio-esp32/reply_d42eb262ffb9492a827f1297fdfeeff2.wav?rate=16000&bits=8";
+static const bool AUTO_LOOP_TEST_AUDIO = false;
+static const char *TEST_WIFI_SSID = "spad0604";
+static const char *TEST_WIFI_PASS = "06042004";
 
 // HMI UART
 static HardwareSerial HmiSerial(2);
@@ -47,20 +50,21 @@ static const int SPK_BCLK = 27;
 static const int VOLUME_ADC_PIN = 33;
 #define VOLUME_ADC_READ_INTERVAL_MS 250
 #define VOLUME_ADC_HYSTERESIS      120
-static const uint16_t VOLUME_GAIN_PERMILLE[5] = {0, 250, 500, 750, 1000};
+static const uint16_t VOLUME_GAIN_PERMILLE[5] = {0, 500, 1000, 1750, 2500};
 static volatile uint16_t currentVolumeGainPermille = 1000;
 static uint8_t currentVolumeStep = 4;
 static uint32_t lastVolumeReadMs = 0;
 
-// Larger chunks reduce WiFi/I2S scheduling jitter. 1024 frames = about 64 ms at 16 kHz.
-#define PCM_FRAMES_PER_CHUNK 1024
+// Keep chunks large enough for I2S stability, but not so large that WiFi runs out of heap.
+#define PCM_FRAMES_PER_CHUNK 2048
 #define MIC_FRAMES_PER_CHUNK 160
 
 // Ring buffer between HTTP download and I2S playback.
 // Keep this on heap, not static DRAM, because ESP32 DevKit V1 has limited .dram0.bss.
-// 48 KB is about 1.5 seconds of 16 kHz 16-bit mono output.
-#define AUDIO_RING_BYTES      (48 * 1024)
-#define AUDIO_PREBUFFER_BYTES (32 * 1024)
+// Bigger buffers trade RAM for smoother playback. Leave enough heap for WiFi/TCP.
+#define AUDIO_RING_BYTES      (64 * 1024)
+#define AUDIO_PREBUFFER_BYTES (48 * 1024)
+#define AUDIO_LOW_WATER_BYTES (16 * 1024)
 #define AUDIO_TASK_STACK      3072
 
 // Keep speaker on I2S0 because your speaker-only test is stable with this.
@@ -93,6 +97,8 @@ static volatile bool audioPlaybackActive = false;
 static volatile bool audioPlaybackStopping = false;
 static volatile bool audioPlaybackFinished = true;
 static volatile uint32_t audioUnderruns = 0;
+static volatile uint32_t audioPlaybackFrameIndex = 0;
+static volatile uint16_t audioPlaybackGainPermille = 1000;
 
 struct WavInfo {
   uint32_t sampleRate = 0;
@@ -100,6 +106,9 @@ struct WavInfo {
   uint16_t channels = 0;
   uint32_t dataSize = 0;
 };
+
+static void processCommandInputs(bool allowPlaybackCommand);
+static void writeToneMs(uint32_t ms, uint32_t frequencyHz);
 
 static inline uint16_t readLE16(const uint8_t *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -163,20 +172,38 @@ static void updateVolumeStep(bool forceLog = false) {
   }
 }
 
-static int16_t amplifySampleRamp(int16_t input, uint32_t frameIndex) {
-  const uint32_t rampFrames = SPEAKER_SAMPLE_RATE / 4; // 0.25s
-  uint32_t rampPermille = 1000;
-  if (frameIndex < rampFrames) {
-    rampPermille = (frameIndex * 1000UL) / rampFrames;
-  }
-
-  uint16_t gainPermille = currentVolumeGainPermille;
+static int16_t amplifySample(int16_t input, uint16_t gainPermille) {
   int32_t value = (int32_t)input;
   value = (value * (int32_t)gainPermille) / 1000;
-  value = (value * (int32_t)rampPermille) / 1000;
   if (value > 32767) value = 32767;
   if (value < -32768) value = -32768;
   return (int16_t)value;
+}
+
+static int16_t wavFrameToPcm16(const uint8_t *frame, const WavInfo &wav) {
+  if (wav.bitsPerSample == 8) {
+    if (wav.channels == 1) {
+      return (int16_t)(((int32_t)frame[0] - 128) << 8);
+    }
+    int32_t left = (int32_t)frame[0] - 128;
+    int32_t right = (int32_t)frame[1] - 128;
+    return (int16_t)(((left + right) / 2) << 8);
+  }
+
+  if (wav.channels == 1) {
+    return (int16_t)readLE16(frame);
+  }
+
+  int16_t left = (int16_t)readLE16(frame);
+  int16_t right = (int16_t)readLE16(frame + 2);
+  return (int16_t)(((int32_t)left + (int32_t)right) / 2);
+}
+
+static int16_t squareToneSample(uint32_t frameIndex, uint32_t frequencyHz, uint16_t gainPermille) {
+  uint32_t halfPeriod = SPEAKER_SAMPLE_RATE / (frequencyHz * 2);
+  if (halfPeriod == 0) halfPeriod = 1;
+  int16_t sample = ((frameIndex / halfPeriod) & 1) ? 12000 : -12000;
+  return amplifySample(sample, gainPermille);
 }
 
 static int16_t micSampleToPcm16(int32_t sample) {
@@ -199,6 +226,48 @@ static String absoluteAudioUrl(const String &audio_url) {
   if (audio_url.startsWith("http://") || audio_url.startsWith("https://")) return audio_url;
   if (audio_url.startsWith("/")) return String(SERVER_BASE_URL) + audio_url;
   return audio_url;
+}
+
+static String esp32AudioUrl(const String &audio_url) {
+  String url = absoluteAudioUrl(audio_url);
+  int audioPath = url.indexOf("/api/v1/audio/");
+  if (audioPath >= 0 && url.indexOf("/api/v1/audio-esp32/") < 0) {
+    url = url.substring(0, audioPath) + "/api/v1/audio-esp32/" + url.substring(audioPath + 14);
+  }
+
+  if (url.indexOf("/api/v1/audio-esp32/") >= 0) {
+    if (url.indexOf("rate=") < 0) {
+      url += (url.indexOf('?') >= 0) ? "&rate=16000" : "?rate=16000";
+    }
+    if (url.indexOf("bits=") < 0) {
+      url += "&bits=8";
+    }
+  }
+
+  return url;
+}
+
+static String extractAudioUrl(String line) {
+  line.trim();
+  if (line.startsWith("PLAY_URL ")) return line.substring(9);
+  if (line.startsWith("http://") || line.startsWith("https://") || line.startsWith("/api/v1/audio/")) return line;
+
+  int key = line.indexOf("\"audio_url\"");
+  if (key < 0) key = line.indexOf("audio_url");
+  if (key < 0) return "";
+
+  int colon = line.indexOf(':', key);
+  if (colon < 0) return "";
+
+  int start = colon + 1;
+  while (start < line.length() && (line[start] == ' ' || line[start] == '\t' || line[start] == '"')) start++;
+
+  int end = start;
+  while (end < line.length() && line[end] != '"' && line[end] != ',' && line[end] != '}' && line[end] != '\r' && line[end] != '\n') end++;
+
+  String url = line.substring(start, end);
+  url.trim();
+  return url;
 }
 
 static bool parseHttpUrl(const String &url, String &host, uint16_t &port, String &path) {
@@ -271,7 +340,7 @@ static bool readHttpLine(WiFiClient &client, char *line, size_t maxLen) {
       delay(1);
     }
 
-    if (millis() - lastData > 5000) {
+    if (millis() - lastData > 8000) {
       line[idx] = '\0';
       return false;
     }
@@ -356,7 +425,7 @@ static bool parseWavHeader(WiFiClient &client, WavInfo &info) {
       info.sampleRate = readLE32(fmt + 4);
       info.bitsPerSample = readLE16(fmt + 14);
 
-      if (audioFormat != 1 || info.bitsPerSample != 16 ||
+      if (audioFormat != 1 || (info.bitsPerSample != 8 && info.bitsPerSample != 16) ||
           (info.channels != 1 && info.channels != 2)) {
         Serial.printf("Unsupported WAV fmt format=%u ch=%u rate=%lu bits=%u\n",
                       audioFormat, info.channels,
@@ -643,6 +712,13 @@ static void audioPlaybackTask(void *param) {
       continue;
     }
 
+    int16_t *samples = (int16_t *)audioTaskBuffer;
+    size_t sampleCount = n / sizeof(int16_t);
+    uint16_t gainPermille = audioPlaybackGainPermille;
+    for (size_t i = 0; i < sampleCount; i++) {
+      samples[i] = amplifySample(samples[i], gainPermille);
+    }
+
     size_t bytesWritten = 0;
     esp_err_t err = i2s_write(I2S_SPK_PORT,
                               audioTaskBuffer,
@@ -662,8 +738,6 @@ static void audioPlaybackTask(void *param) {
 }
 
 static bool ensureAudioPlaybackTask() {
-  if (!audioRingInit()) return false;
-
   if (audioTaskHandle != nullptr) return true;
 
   BaseType_t ok = xTaskCreatePinnedToCore(audioPlaybackTask,
@@ -684,6 +758,8 @@ static bool ensureAudioPlaybackTask() {
 
 static void startBufferedPlayback() {
   if (!audioPlaybackActive) {
+    audioPlaybackFrameIndex = 0;
+    audioPlaybackGainPermille = currentVolumeGainPermille;
     audioPlaybackFinished = false;
     audioPlaybackStopping = false;
     audioPlaybackActive = true;
@@ -722,19 +798,16 @@ static void writeSilenceMs(uint32_t ms) {
 static void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
-  Preferences prefs;
-  prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", "spad0604");
-  String pass = prefs.getString("pass", "06042004");
-  prefs.end();
-
   Serial.print("Connecting WiFi: ");
-  Serial.println(ssid);
+  Serial.println(TEST_WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false); // Test build: do not write WiFi config to flash.
+  WiFi.disconnect(false, false);
+  delay(250);
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  WiFi.begin(TEST_WIFI_SSID, TEST_WIFI_PASS);
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -755,7 +828,7 @@ static void connectWiFi() {
 
 
 static bool saveWavPcmToLittleFS(WiFiClient &client, uint32_t dataSize, const char *path) {
-  if (!LittleFS.begin(true)) {
+  if (!LittleFS.begin(false)) {
     Serial.println("LittleFS mount failed");
     return false;
   }
@@ -842,7 +915,7 @@ static bool playCachedPcmFromLittleFS(const char *path, const WavInfo &wav) {
   i2s_zero_dma_buffer(I2S_SPK_PORT);
   writeSilenceMs(80);
 
-  const size_t bytesPerInputFrame = wav.channels * sizeof(int16_t);
+  const size_t bytesPerInputFrame = wav.channels * (wav.bitsPerSample / 8);
   uint32_t remaining = wav.dataSize;
   uint32_t frameIndex = 0;
   uint32_t totalWritten = 0;
@@ -868,15 +941,10 @@ static bool playCachedPcmFromLittleFS(const char *path, const WavInfo &wav) {
     int frames = bytesRead / (int)bytesPerInputFrame;
     int outIndex = 0;
 
-    if (wav.channels == 1) {
-      for (int i = 0; i < frames; i++) {
-        outputBuffer[outIndex++] = amplifySampleRamp(inputBuffer[i], frameIndex++);
-      }
-    } else {
-      for (int i = 0; i < frames; i++) {
-        int32_t mixed = ((int32_t)inputBuffer[i * 2] + (int32_t)inputBuffer[i * 2 + 1]) / 2;
-        outputBuffer[outIndex++] = amplifySampleRamp((int16_t)mixed, frameIndex++);
-      }
+    const uint8_t *inputBytes = (const uint8_t *)inputBuffer;
+    for (int i = 0; i < frames; i++) {
+      outputBuffer[outIndex++] = amplifySample(wavFrameToPcm16(inputBytes + (i * bytesPerInputFrame), wav),
+                                               currentVolumeGainPermille);
     }
 
     size_t bytesWritten = 0;
@@ -930,11 +998,17 @@ static bool playWavFromUrl(const String &audioUrl) {
     return false;
   }
   speaker_playing = true;
-  String url = absoluteAudioUrl(audioUrl);
+  bool ok = false;
+  String url = esp32AudioUrl(audioUrl);
+  Serial.print("Resolved playback URL: ");
+  Serial.println(url);
   String host, path;
   uint16_t port = 80;
 
-  if (!parseHttpUrl(url, host, port, path)) return false;
+  if (!parseHttpUrl(url, host, port, path)) {
+    speaker_playing = false;
+    return false;
+  }
 
   // Stop mic while playing to avoid I2S/power contention.
   if (recording_enabled || mic_installed) {
@@ -943,7 +1017,16 @@ static bool playWavFromUrl(const String &audioUrl) {
   }
 
   connectWiFi();
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    speaker_playing = false;
+    return false;
+  }
+
+  if (!setupSpeaker() || !ensureAudioPlaybackTask()) {
+    Serial.println("Speaker/playback task init failed");
+    speaker_playing = false;
+    return false;
+  }
 
   Serial.print("Connecting audio server: ");
   Serial.print(host);
@@ -955,6 +1038,7 @@ static bool playWavFromUrl(const String &audioUrl) {
 
   if (!client.connect(host.c_str(), port)) {
     Serial.println("TCP connect failed");
+    speaker_playing = false;
     return false;
   }
 
@@ -970,12 +1054,14 @@ static bool playWavFromUrl(const String &audioUrl) {
 
   if (!skipHttpHeaders(client)) {
     client.stop();
+    speaker_playing = false;
     return false;
   }
 
   WavInfo wav;
   if (!parseWavHeader(client, wav)) {
     client.stop();
+    speaker_playing = false;
     return false;
   }
 
@@ -988,24 +1074,116 @@ static bool playWavFromUrl(const String &audioUrl) {
   if (wav.sampleRate != SPEAKER_SAMPLE_RATE) {
     Serial.printf("Unsupported sample rate. Expected %u Hz.\n", SPEAKER_SAMPLE_RATE);
     client.stop();
+    speaker_playing = false;
     return false;
   }
 
-  static const char *CACHE_PATH = "/reply_audio.pcm";
-  bool saved = saveWavPcmToLittleFS(client, wav.dataSize, CACHE_PATH);
+  const size_t bytesPerInputFrame = wav.channels * (wav.bitsPerSample / 8);
+  uint32_t remaining = wav.dataSize;
+  uint32_t totalIn = 0;
+  uint32_t totalOut = 0;
+  uint32_t lastLog = millis();
+  bool playbackStarted = false;
+
+  audioRingClear();
+  audioUnderruns = 0;
+  i2s_zero_dma_buffer(I2S_SPK_PORT);
+  writeSilenceMs(60);
+  updateVolumeStep(true);
+  audioPlaybackGainPermille = currentVolumeGainPermille;
+
+  Serial.printf("Streaming playback prebuffer=%u ring=%u lowWater=%u\n",
+                (unsigned)AUDIO_PREBUFFER_BYTES,
+                (unsigned)AUDIO_RING_BYTES,
+                (unsigned)AUDIO_LOW_WATER_BYTES);
+
+  while (remaining > 0) {
+    updateVolumeStep(false);
+    audioPlaybackGainPermille = currentVolumeGainPermille;
+
+    size_t want = PCM_FRAMES_PER_CHUNK * bytesPerInputFrame;
+    if (remaining < want) want = remaining;
+    want = (want / bytesPerInputFrame) * bytesPerInputFrame;
+    if (want == 0) break;
+
+    if (!readExact(client, (uint8_t *)inputBuffer, want, 8000)) {
+      Serial.println("HTTP stream read failed");
+      break;
+    }
+
+    size_t bytesRead = want;
+    remaining -= (uint32_t)bytesRead;
+    totalIn += (uint32_t)bytesRead;
+
+    int frames = bytesRead / (int)bytesPerInputFrame;
+    int outIndex = 0;
+
+    const uint8_t *inputBytes = (const uint8_t *)inputBuffer;
+    for (int i = 0; i < frames; i++) {
+      outputBuffer[outIndex++] = wavFrameToPcm16(inputBytes + (i * bytesPerInputFrame), wav);
+    }
+
+    size_t outBytes = outIndex * sizeof(int16_t);
+    if (!audioRingWriteBlocking((const uint8_t *)outputBuffer, outBytes, 10000)) {
+      Serial.println("Audio ring write timeout");
+      break;
+    }
+    totalOut += (uint32_t)outBytes;
+
+    size_t fill = audioRingFill();
+    if (!playbackStarted && (fill >= AUDIO_PREBUFFER_BYTES || remaining == 0)) {
+      Serial.printf("Start streaming playback, buffered=%u bytes\n", (unsigned)fill);
+      startBufferedPlayback();
+      playbackStarted = true;
+    }
+
+    if (millis() - lastLog > 1000) {
+      lastLog = millis();
+      Serial.printf("streaming... remaining=%lu ring=%u in=%lu out=%lu underruns=%lu heap=%u\n",
+                    (unsigned long)remaining,
+                    (unsigned)fill,
+                    (unsigned long)totalIn,
+                    (unsigned long)totalOut,
+                    (unsigned long)audioUnderruns,
+                    (unsigned)ESP.getFreeHeap());
+    }
+
+    processCommandInputs(false);
+    delay(0);
+  }
+
   client.stop();
 
-  if (!saved) {
-    Serial.println("PLAY_URL failed while caching audio");
+  if (!playbackStarted && audioRingFill() > 0) {
+    startBufferedPlayback();
+    playbackStarted = true;
+  }
+
+  if (remaining == 0 && playbackStarted) {
+    stopBufferedPlaybackAndWait(20000);
+    ok = audioRingFill() == 0;
+  } else {
+    audioPlaybackActive = false;
+    audioPlaybackStopping = false;
+    audioPlaybackFinished = true;
+  }
+
+  writeSilenceMs(120);
+  i2s_zero_dma_buffer(I2S_SPK_PORT);
+
+  if (!ok) {
+    Serial.printf("Streaming playback failed: remaining=%lu ring=%u underruns=%lu\n",
+                  (unsigned long)remaining,
+                  (unsigned)audioRingFill(),
+                  (unsigned long)audioUnderruns);
+    speaker_playing = false;
     return false;
   }
 
-  bool played = playCachedPcmFromLittleFS(CACHE_PATH, wav);
-
-  if (!played) {
-    Serial.println("PLAY_URL failed while playing cached audio");
-    return false;
-  }
+  Serial.printf("Streaming playback done: in=%lu out=%lu underruns=%lu\n",
+                (unsigned long)totalIn,
+                (unsigned long)totalOut,
+                (unsigned long)audioUnderruns);
 
   HmiSerial.print("OK PLAY_DONE\n");
   speaker_playing = false;
@@ -1107,7 +1285,7 @@ static void printMicLevelOnce() {
                 (unsigned)count);
 }
 
-static void playUrl(const String &url) {
+static bool playUrl(const String &url) {
   Serial.print("Play URL requested: ");
   Serial.println(url);
 
@@ -1118,6 +1296,7 @@ static void playUrl(const String &url) {
     HmiSerial.print("ERR PLAY_URL_FAILED\n");
     Serial.println("PLAY_URL failed");
   }
+  return ok;
 }
 
 static bool isKnownCommandPrefix(const String &line) {
@@ -1126,11 +1305,16 @@ static bool isKnownCommandPrefix(const String &line) {
          line == "REC_STOP" ||
          line == "MIC_TEST" ||
          line.startsWith("WIFI_CREDS ") ||
-         line.startsWith("PLAY_URL ");
+         line.startsWith("PLAY_URL ") ||
+         line.startsWith("http://") ||
+         line.startsWith("https://") ||
+         line.indexOf("audio_url") >= 0;
 }
 
 static void handleCommand(String line) {
   line.trim();
+  String audioUrl = extractAudioUrl(line);
+
   if (line == "PING") {
     Serial.println("OK READY");
     HmiSerial.print("OK READY\n");
@@ -1140,26 +1324,90 @@ static void handleCommand(String line) {
     stopRecording();
   } else if (line == "MIC_TEST") {
     printMicLevelOnce();
-  } else if (line.startsWith("PLAY_URL ")) {
-    playUrl(line.substring(9));
+  } else if (audioUrl.length() > 0) {
+    playUrl(audioUrl);
   } else if (line.startsWith("WIFI_CREDS ")) {
-    String payload = line.substring(11);
-    int spaceIdx = payload.indexOf(' ');
-    if (spaceIdx > 0) {
-      String ssid = payload.substring(0, spaceIdx);
-      String pass = payload.substring(spaceIdx + 1);
-      Preferences prefs;
-      prefs.begin("wifi", false);
-      prefs.putString("ssid", ssid);
-      prefs.putString("pass", pass);
-      prefs.end();
-      Serial.println("Saved new WiFi credentials. Reconnecting...");
-      WiFi.disconnect();
-      connectWiFi();
-    }
+    Serial.println("WIFI_CREDS ignored in streaming test build; flash is untouched");
+    HmiSerial.print("OK WIFI_CREDS_IGNORED\n");
   } else if (line.length() > 0) {
     Serial.print("Unknown command: ");
     Serial.println(line);
+  }
+}
+
+static void writeToneMs(uint32_t ms, uint32_t frequencyHz) {
+  if (!setupSpeaker()) {
+    Serial.println("Cannot write tone: speaker init failed");
+    return;
+  }
+
+  updateVolumeStep(true);
+  uint32_t totalFrames = (SPEAKER_SAMPLE_RATE * ms) / 1000;
+  uint32_t frameIndex = 0;
+
+  while (frameIndex < totalFrames) {
+    size_t frames = totalFrames - frameIndex;
+    if (frames > PCM_FRAMES_PER_CHUNK) frames = PCM_FRAMES_PER_CHUNK;
+
+    for (size_t i = 0; i < frames; i++) {
+      outputBuffer[i] = squareToneSample(frameIndex + i, frequencyHz, currentVolumeGainPermille);
+    }
+
+    size_t written = 0;
+    esp_err_t err = i2s_write(I2S_SPK_PORT,
+                              outputBuffer,
+                              frames * sizeof(int16_t),
+                              &written,
+                              pdMS_TO_TICKS(500));
+    if (err != ESP_OK || written == 0) {
+      Serial.printf("tone i2s_write failed: %s written=%u\n",
+                    esp_err_to_name(err),
+                    (unsigned)written);
+      return;
+    }
+
+    frameIndex += frames;
+    delay(0);
+  }
+}
+
+static void processCommandInputs(bool allowPlaybackCommand) {
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (!allowPlaybackCommand && extractAudioUrl(line).length() > 0) {
+      Serial.println("Reject audio URL: playback is busy");
+    } else {
+      handleCommand(line);
+    }
+  }
+
+  while (HmiSerial.available()) {
+    char c = (char)HmiSerial.read();
+    if (c == '\n') {
+      hmi_line.trim();
+      if (hmi_line.length() > 0) {
+        if (isKnownCommandPrefix(hmi_line)) {
+          Serial.print("[UART CMD] ");
+          Serial.println(hmi_line);
+          if (!allowPlaybackCommand && extractAudioUrl(hmi_line).length() > 0) {
+            HmiSerial.print("ERR SPEAKER_BUSY\n");
+          } else {
+            handleCommand(hmi_line);
+          }
+        } else {
+          Serial.print("[UART IGNORE] ");
+          Serial.println(hmi_line);
+        }
+      }
+      hmi_line = "";
+    } else if (c != '\r') {
+      if (hmi_line.length() < 1024) {
+        hmi_line += c;
+      } else {
+        hmi_line = "";
+      }
+    }
   }
 }
 
@@ -1192,13 +1440,7 @@ void setup() {
   micPinsHighZ();
   Serial.println("Mic lazy mode: pins high-Z until REC_START");
 
-  if (LittleFS.begin(true)) {
-    Serial.printf("LittleFS ready: total=%u used=%u\n",
-                  (unsigned)LittleFS.totalBytes(),
-                  (unsigned)LittleFS.usedBytes());
-  } else {
-    Serial.println("LittleFS mount failed at boot");
-  }
+  Serial.println("LittleFS skipped in streaming test build; flash is untouched");
 
   connectWiFi();
   if (!setupSpeaker()) {
@@ -1219,35 +1461,14 @@ void setup() {
 void loop() {
   updateVolumeStep(false);
 
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    handleCommand(line);
-  }
-
-  while (HmiSerial.available()) {
-    char c = (char)HmiSerial.read();
-    if (c == '\n') {
-      hmi_line.trim();
-      if (hmi_line.length() > 0) {
-        if (isKnownCommandPrefix(hmi_line)) {
-          Serial.print("[UART CMD] ");
-          Serial.println(hmi_line);
-          handleCommand(hmi_line);
-        } else {
-          Serial.print("[UART IGNORE] ");
-          Serial.println(hmi_line);
-        }
-      }
-      hmi_line = "";
-    } else if (c != '\r') {
-      if (hmi_line.length() < 240) {
-        hmi_line += c;
-      } else {
-        hmi_line = "";
-      }
-    }
-  }
+  processCommandInputs(true);
 
   streamMicToHmi();
+
+  if (AUTO_LOOP_TEST_AUDIO && !speaker_playing && !recording_enabled) {
+    bool ok = playUrl(TEST_AUDIO_URL);
+    delay(ok ? 500 : 3000);
+  }
+
   delay(1);
 }
