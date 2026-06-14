@@ -70,6 +70,7 @@ static uint32_t lastVolumeReadMs = 0;
 #define AUDIO_PREBUFFER_BYTES (48 * 1024)
 #define AUDIO_LOW_WATER_BYTES (16 * 1024)
 #define AUDIO_TASK_STACK      3072
+#define HTTP_TAIL_MISSING_TOLERANCE_BYTES 4096
 
 // Keep speaker on I2S0 because your speaker-only test is stable with this.
 static const i2s_port_t I2S_SPK_PORT = I2S_NUM_0;
@@ -303,8 +304,14 @@ static int findAudioUrlStart(const String &line) {
 }
 
 static String sliceAudioUrl(const String &line, int start) {
+  int wifiCreds = line.indexOf("WIFI_CREDS", start + 1);
+  int playUrl = line.indexOf("PLAY_URL ", start + 1);
+
   int end = start;
   while (end < line.length()) {
+    if ((wifiCreds >= 0 && end >= wifiCreds) || (playUrl >= 0 && end >= playUrl)) {
+      break;
+    }
     char ch = line[end];
     if ((uint8_t)ch < 33 || (uint8_t)ch > 126 ||
         ch == ' ' || ch == '\t' || ch == '"' || ch == '\'' ||
@@ -872,6 +879,31 @@ static bool percentDecode(const String &input, String &output) {
   return true;
 }
 
+static size_t readUpTo(WiFiClient &client, uint8_t *buffer, size_t len, uint32_t timeoutMs = 5000) {
+  size_t total = 0;
+  uint32_t lastData = millis();
+
+  while (total < len) {
+    int avail = client.available();
+    if (avail > 0) {
+      size_t want = len - total;
+      if (want > (size_t)avail) want = avail;
+      int n = client.read(buffer + total, want);
+      if (n > 0) {
+        total += (size_t)n;
+        lastData = millis();
+      }
+    } else {
+      if (!client.connected()) break;
+      delay(1);
+    }
+
+    if (millis() - lastData > timeoutMs) break;
+  }
+
+  return total;
+}
+
 static bool loadStoredWiFiCredentials(String &ssid, String &pass) {
   Preferences prefs;
   if (!prefs.begin(WIFI_PREF_NAMESPACE, true)) {
@@ -1297,14 +1329,38 @@ static bool playWavFromUrl(const String &audioUrl) {
     want = (want / bytesPerInputFrame) * bytesPerInputFrame;
     if (want == 0) break;
 
-    if (!readExact(client, (uint8_t *)inputBuffer, want, 8000)) {
-      Serial.println("HTTP stream read failed");
+    size_t bytesRead = readUpTo(client, (uint8_t *)inputBuffer, want, 8000);
+    bytesRead = (bytesRead / bytesPerInputFrame) * bytesPerInputFrame;
+
+    if (bytesRead == 0) {
+      if (remaining <= HTTP_TAIL_MISSING_TOLERANCE_BYTES && totalOut > 0) {
+        Serial.printf("HTTP stream ended near EOF; tolerate missing tail=%lu bytes\n",
+                      (unsigned long)remaining);
+        remaining = 0;
+      } else {
+        Serial.printf("HTTP stream read failed, remaining=%lu wanted=%u\n",
+                      (unsigned long)remaining,
+                      (unsigned)want);
+      }
       break;
     }
 
-    size_t bytesRead = want;
     remaining -= (uint32_t)bytesRead;
     totalIn += (uint32_t)bytesRead;
+    if (bytesRead < want) {
+      if (remaining <= HTTP_TAIL_MISSING_TOLERANCE_BYTES) {
+        Serial.printf("HTTP stream short near EOF; got=%u wanted=%u missing=%lu tolerated\n",
+                      (unsigned)bytesRead,
+                      (unsigned)want,
+                      (unsigned long)remaining);
+        remaining = 0;
+      } else {
+        Serial.printf("HTTP stream short read; got=%u wanted=%u remaining=%lu\n",
+                      (unsigned)bytesRead,
+                      (unsigned)want,
+                      (unsigned long)remaining);
+      }
+    }
 
     int frames = bytesRead / (int)bytesPerInputFrame;
     int outIndex = 0;

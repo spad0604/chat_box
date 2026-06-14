@@ -59,6 +59,7 @@ static String pending_text;
 static volatile bool pending_text_send = false;
 static volatile bool pending_voice_toggle = false;
 static bool recording = false;
+static bool audio_playback_in_flight = false;
 static uint8_t *pcm_buffer = nullptr;
 static size_t pcm_len = 0;
 static String current_wifi_ssid;
@@ -561,7 +562,7 @@ static void loadConfiguredWiFiCredentials(String &ssid, String &pass)
 
 static void syncAudioBoardWiFiCredentials(bool force)
 {
-    if (in_ap_mode || recording || WiFi.status() != WL_CONNECTED) {
+    if (in_ap_mode || recording || audio_playback_in_flight || WiFi.status() != WL_CONNECTED) {
         return;
     }
 
@@ -631,9 +632,11 @@ static void playAudioUrl(const String &audio_url)
     }
     String url = absoluteAudioUrl(audio_url);
     ui_status("Speaking...");
+    audio_playback_in_flight = true;
     AudioSerial.print("PLAY_URL ");
     AudioSerial.print(url);
     AudioSerial.print("\n");
+    AudioSerial.flush();
     Serial.print("[UART->AUDIO] PLAY_URL ");
     Serial.println(url);
 }
@@ -2008,7 +2011,11 @@ static void pumpAudioSerial(uint32_t duration_ms = 0)
                             Serial.print("Audio board: ");
                             Serial.println(audio_uart_line);
                             if (audio_uart_line == "OK PLAY_DONE" || audio_uart_line == "OK PLAY_URL_DONE") {
+                                audio_playback_in_flight = false;
                                 ui_status("Online");
+                            } else if (audio_uart_line == "ERR PLAY_URL_FAILED") {
+                                audio_playback_in_flight = false;
+                                ui_status("Error");
                             }
                         }
                         audio_uart_line = "";
@@ -2231,6 +2238,16 @@ void loop()
 
     if (pending_voice_toggle) {
         pending_voice_toggle = false;
+        if (audio_playback_in_flight) {
+            if (lvgl_port_lock(100)) {
+                ui_chat_set_mic_recording(false);
+                lvgl_port_unlock();
+            }
+            ui_status("Speaking...");
+            Serial.println("Ignore mic toggle while audio playback is active");
+            delay(2);
+            return;
+        }
         bool should_record = ui_chat_is_mic_recording();
         if (should_record && !recording) {
             pcm_len = 0;

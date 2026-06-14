@@ -19,6 +19,7 @@ void ui_chat_add_message(const char *role, const char *message);
 void ui_chat_clear_messages();
 void ui_chat_set_status(const char *status);
 bool ui_chat_is_mic_recording();
+void ui_chat_set_mic_recording(bool recording);
 void ui_chat_set_datetime(const char *time_text, const char *date_text);
 
 // Render a list of chat sessions in the chat area. Each item is clickable and will

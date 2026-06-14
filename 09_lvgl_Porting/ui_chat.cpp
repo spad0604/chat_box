@@ -48,6 +48,121 @@ static lv_style_t style_input;
 static lv_style_t style_send_button;
 static lv_style_t style_close_button;
 
+static void append_utf8(char *out, size_t out_size, size_t *pos, uint32_t cp)
+{
+    if (*pos + 1 >= out_size) return;
+
+    if (cp <= 0x7f) {
+        out[(*pos)++] = (char)cp;
+    } else if (cp <= 0x7ff && *pos + 2 < out_size) {
+        out[(*pos)++] = (char)(0xc0 | (cp >> 6));
+        out[(*pos)++] = (char)(0x80 | (cp & 0x3f));
+    } else if (cp <= 0xffff && *pos + 3 < out_size) {
+        out[(*pos)++] = (char)(0xe0 | (cp >> 12));
+        out[(*pos)++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[(*pos)++] = (char)(0x80 | (cp & 0x3f));
+    } else if (cp <= 0x10ffff && *pos + 4 < out_size) {
+        out[(*pos)++] = (char)(0xf0 | (cp >> 18));
+        out[(*pos)++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        out[(*pos)++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[(*pos)++] = (char)(0x80 | (cp & 0x3f));
+    }
+}
+
+static void append_space(char *out, size_t out_size, size_t *pos)
+{
+    if (*pos == 0 || out[*pos - 1] == ' ') return;
+    append_utf8(out, out_size, pos, ' ');
+}
+
+static bool decode_utf8_char(const char *s, size_t len, size_t *i, uint32_t *cp)
+{
+    uint8_t c = (uint8_t)s[*i];
+    if (c < 0x80) {
+        *cp = c;
+        (*i)++;
+        return true;
+    }
+
+    uint8_t need = 0;
+    uint32_t value = 0;
+    if ((c & 0xe0) == 0xc0) {
+        need = 1;
+        value = c & 0x1f;
+        if (value == 0) return false;
+    } else if ((c & 0xf0) == 0xe0) {
+        need = 2;
+        value = c & 0x0f;
+    } else if ((c & 0xf8) == 0xf0) {
+        need = 3;
+        value = c & 0x07;
+    } else {
+        return false;
+    }
+
+    if (*i + need >= len) return false;
+    for (uint8_t j = 1; j <= need; j++) {
+        uint8_t cc = (uint8_t)s[*i + j];
+        if ((cc & 0xc0) != 0x80) return false;
+        value = (value << 6) | (cc & 0x3f);
+    }
+
+    *i += need + 1;
+    *cp = value;
+    return true;
+}
+
+static bool is_supported_text_cp(uint32_t cp)
+{
+    if (cp >= 0x20 && cp <= 0x7e) return true;
+    if (cp >= 0x00c0 && cp <= 0x1ef9) return true; // Vietnamese Latin ranges in font_vietnamese_16.
+    return false;
+}
+
+static void sanitize_display_text(const char *input, char *out, size_t out_size)
+{
+    if (out_size == 0) return;
+    size_t pos = 0;
+    size_t len = input ? strlen(input) : 0;
+
+    for (size_t i = 0; i < len && pos + 1 < out_size;) {
+        size_t before = i;
+        uint32_t cp = 0;
+        if (!decode_utf8_char(input, len, &i, &cp)) {
+            i = before + 1;
+            append_space(out, out_size, &pos);
+            continue;
+        }
+
+        if (cp == '\n' || cp == '\r' || cp == '\t' || cp == 0x00a0) {
+            append_space(out, out_size, &pos);
+        } else if (cp == '`' || cp == '*' || cp == '#' || cp == '_' ||
+                   cp == '~' || cp == '>' || cp == '[' || cp == ']') {
+            continue;
+        } else if (cp == 0x2018 || cp == 0x2019) {
+            append_utf8(out, out_size, &pos, '\'');
+        } else if (cp == 0x201c || cp == 0x201d) {
+            append_utf8(out, out_size, &pos, '"');
+        } else if (cp == 0x2010 || cp == 0x2011 || cp == 0x2012 || cp == 0x2013 || cp == 0x2014) {
+            append_utf8(out, out_size, &pos, '-');
+        } else if (cp == 0x2026) {
+            append_utf8(out, out_size, &pos, '.');
+            append_utf8(out, out_size, &pos, '.');
+            append_utf8(out, out_size, &pos, '.');
+        } else if (cp == 0x2022) {
+            append_utf8(out, out_size, &pos, '-');
+            append_space(out, out_size, &pos);
+        } else if (is_supported_text_cp(cp)) {
+            append_utf8(out, out_size, &pos, cp);
+        } else {
+            append_space(out, out_size, &pos);
+        }
+    }
+
+    while (pos > 0 && out[pos - 1] == ' ') pos--;
+    out[pos] = '\0';
+}
+
 static int16_t disp_w()
 {
     return lv_disp_get_hor_res(NULL);
@@ -906,7 +1021,9 @@ void ui_chat_show_sessions(const char *const *titles, uint8_t count)
     }
 
     for (uint8_t i = 0; i < count; i++) {
-        const char *title = titles[i] ? titles[i] : "(unknown)";
+        static char clean_title[256];
+        sanitize_display_text(titles[i] ? titles[i] : "(unknown)", clean_title, sizeof(clean_title));
+        const char *title = clean_title[0] ? clean_title : "(unknown)";
 
         lv_obj_t *btn = lv_btn_create(chat_list);
         lv_obj_remove_style_all(btn);
@@ -931,6 +1048,12 @@ void ui_chat_add_message(const char *role, const char *message)
         return;
     }
 
+    static char clean_message[2048];
+    sanitize_display_text(message, clean_message, sizeof(clean_message));
+    if (clean_message[0] == '\0') {
+        return;
+    }
+
     set_typing_indicator(false, NULL);
 
     lv_obj_t *row = create_message_row(role);
@@ -940,7 +1063,7 @@ void ui_chat_add_message(const char *role, const char *message)
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
 
     lv_obj_t *label = lv_label_create(bubble);
-    lv_label_set_text(label, message);
+    lv_label_set_text(label, clean_message);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(label, LV_PCT(100));
     lv_obj_set_style_text_font(label, &font_vietnamese_16, 0);
@@ -990,6 +1113,12 @@ void ui_chat_set_datetime(const char *time_text, const char *date_text)
 bool ui_chat_is_mic_recording()
 {
     return mic_is_recording;
+}
+
+void ui_chat_set_mic_recording(bool recording)
+{
+    mic_is_recording = recording;
+    update_mic_recording_ui();
 }
 
 
