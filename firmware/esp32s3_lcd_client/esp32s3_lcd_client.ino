@@ -23,6 +23,8 @@ static const uint32_t AUDIO_UART_BAUD = 460800;
 
 static uint32_t audio_frames_sent = 0;
 static uint32_t audio_bytes_sent = 0;
+static uint32_t last_wifi_creds_sync_ms = 0;
+static const uint32_t WIFI_CREDS_SYNC_INTERVAL_MS = 30000;
 
 static inline uint16_t readLE16(const uint8_t *p)
 {
@@ -38,6 +40,63 @@ static void sendAudioBoardCommand(const char *cmd)
 {
     AudioSerial.print(cmd);
     AudioSerial.print("\n");
+}
+
+static bool isUnreservedUrlChar(char c)
+{
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_' || c == '.' || c == '~';
+}
+
+static String percentEncode(const String &input)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    String out;
+    out.reserve(input.length() + 8);
+    for (size_t i = 0; i < input.length(); i++) {
+        uint8_t c = (uint8_t)input[i];
+        if (isUnreservedUrlChar((char)c)) {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[(c >> 4) & 0x0f];
+            out += hex[c & 0x0f];
+        }
+    }
+    return out;
+}
+
+static String encodeWiFiToken(const String &input)
+{
+    if (input.length() == 0) {
+        return "%00";
+    }
+    return percentEncode(input);
+}
+
+static void syncAudioBoardWiFiCredentials(bool force = false)
+{
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    uint32_t now = millis();
+    if (!force && now - last_wifi_creds_sync_ms < WIFI_CREDS_SYNC_INTERVAL_MS) {
+        return;
+    }
+    last_wifi_creds_sync_ms = now;
+
+    AudioSerial.print("WIFI_CREDS_V1 ");
+    AudioSerial.print(percentEncode(WIFI_SSID));
+    AudioSerial.print(" ");
+    AudioSerial.print(encodeWiFiToken(WIFI_PASSWORD));
+    AudioSerial.print("\n");
+
+    Serial.printf("[UART->AUDIO] WIFI_CREDS_V1 ssid=%s pass_len=%u\n",
+                  WIFI_SSID,
+                  (unsigned)strlen(WIFI_PASSWORD));
 }
 
 static void sendSpkFrame(const uint8_t *data, uint16_t len)
@@ -83,6 +142,7 @@ static void connectWiFi()
     Serial.println();
     Serial.print("WiFi IP: ");
     Serial.println(WiFi.localIP());
+    syncAudioBoardWiFiCredentials(true);
 }
 
 static bool parseWavDataOffset(const uint8_t *buf, size_t len, size_t &dataOffset, uint32_t &dataSize)
@@ -405,6 +465,7 @@ void loop()
         }
     }
     readAudioBoardEvents();
+    syncAudioBoardWiFiCredentials();
     delay(10);
 }
 

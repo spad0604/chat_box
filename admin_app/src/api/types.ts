@@ -55,3 +55,11 @@ export type AdminDocument = {
   updated_at: string;
 };
 
+export type CampusImage = {
+  filename: string;
+  url: string;
+};
+
+export type CampusImagesResponse = {
+  images: CampusImage[];
+};

@@ -5,12 +5,13 @@ import { StatusBar } from "expo-status-bar";
 
 import { API_BASE_URL } from "./src/api/client";
 import { DashboardScreen } from "./src/screens/DashboardScreen";
+import { CampusImagesScreen } from "./src/screens/CampusImagesScreen";
 import { ChatHistoryScreen } from "./src/screens/ChatHistoryScreen";
 import { DocumentsScreen } from "./src/screens/DocumentsScreen";
 import { QuestionsScreen } from "./src/screens/QuestionsScreen";
 import { colors, radius, spacing } from "./src/theme";
 
-type TabKey = "dashboard" | "history" | "questions" | "documents";
+type TabKey = "dashboard" | "history" | "questions" | "documents" | "campus";
 
 const tabs: Array<{
   key: TabKey;
@@ -20,7 +21,8 @@ const tabs: Array<{
   { key: "dashboard", label: "Tổng quan", icon: "analytics-outline" },
   { key: "history", label: "Lịch sử chat", icon: "chatbubbles-outline" },
   { key: "questions", label: "Câu hỏi", icon: "help-circle-outline" },
-  { key: "documents", label: "Tài liệu", icon: "document-text-outline" }
+  { key: "documents", label: "Tài liệu", icon: "document-text-outline" },
+  { key: "campus", label: "Ảnh campus", icon: "images-outline" }
 ];
 
 export default function App() {
@@ -30,6 +32,7 @@ export default function App() {
     if (activeTab === "history") return <ChatHistoryScreen />;
     if (activeTab === "questions") return <QuestionsScreen />;
     if (activeTab === "documents") return <DocumentsScreen />;
+    if (activeTab === "campus") return <CampusImagesScreen />;
     return <DashboardScreen />;
   }, [activeTab]);
 
@@ -174,4 +177,3 @@ const styles = StyleSheet.create({
     padding: spacing.xl
   }
 });
-

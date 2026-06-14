@@ -8,6 +8,7 @@
 #include <esp_heap_caps.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 
 // ===================== USER CONFIG =====================
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
@@ -15,6 +16,9 @@ static const char *TEST_AUDIO_URL = "http://54.206.118.226:8000/api/v1/audio-esp
 static const bool AUTO_LOOP_TEST_AUDIO = false;
 static const char *TEST_WIFI_SSID = "spad0604";
 static const char *TEST_WIFI_PASS = "06042004";
+static const char *WIFI_PREF_NAMESPACE = "wifi";
+static const char *WIFI_PREF_SSID_KEY = "ssid";
+static const char *WIFI_PREF_PASS_KEY = "pass";
 
 // HMI UART
 static HardwareSerial HmiSerial(2);
@@ -247,10 +251,26 @@ static String esp32AudioUrl(const String &audio_url) {
   return url;
 }
 
+static int findAudioUrlStart(const String &line);
+static String sliceAudioUrl(const String &line, int start);
+
 static String extractAudioUrl(String line) {
   line.trim();
-  if (line.startsWith("PLAY_URL ")) return line.substring(9);
-  if (line.startsWith("http://") || line.startsWith("https://") || line.startsWith("/api/v1/audio/")) return line;
+  int playKey = line.indexOf("PLAY_URL ");
+  if (playKey >= 0) {
+    String tail = line.substring(playKey + 9);
+    int urlStart = findAudioUrlStart(tail);
+    if (urlStart >= 0) {
+      return sliceAudioUrl(tail, urlStart);
+    }
+    tail.trim();
+    return sliceAudioUrl(tail, 0);
+  }
+
+  int rawUrlStart = findAudioUrlStart(line);
+  if (rawUrlStart >= 0) {
+    return sliceAudioUrl(line, rawUrlStart);
+  }
 
   int key = line.indexOf("\"audio_url\"");
   if (key < 0) key = line.indexOf("audio_url");
@@ -264,6 +284,35 @@ static String extractAudioUrl(String line) {
 
   int end = start;
   while (end < line.length() && line[end] != '"' && line[end] != ',' && line[end] != '}' && line[end] != '\r' && line[end] != '\n') end++;
+
+  String url = line.substring(start, end);
+  url.trim();
+  return url;
+}
+
+static int findAudioUrlStart(const String &line) {
+  int http = line.indexOf("http://");
+  int https = line.indexOf("https://");
+  int api = line.indexOf("/api/v1/audio/");
+
+  int start = -1;
+  if (http >= 0) start = http;
+  if (https >= 0 && (start < 0 || https < start)) start = https;
+  if (api >= 0 && (start < 0 || api < start)) start = api;
+  return start;
+}
+
+static String sliceAudioUrl(const String &line, int start) {
+  int end = start;
+  while (end < line.length()) {
+    char ch = line[end];
+    if ((uint8_t)ch < 33 || (uint8_t)ch > 126 ||
+        ch == ' ' || ch == '\t' || ch == '"' || ch == '\'' ||
+        ch == ',' || ch == '}' || ch == '\r' || ch == '\n') {
+      break;
+    }
+    end++;
+  }
 
   String url = line.substring(start, end);
   url.trim();
@@ -795,11 +844,153 @@ static void writeSilenceMs(uint32_t ms) {
   }
 }
 
+static int hexValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+
+static bool percentDecode(const String &input, String &output) {
+  output = "";
+  output.reserve(input.length());
+  for (int i = 0; i < (int)input.length(); i++) {
+    char c = input[i];
+    if (c == '%') {
+      if (i + 2 >= (int)input.length()) return false;
+      int hi = hexValue(input[i + 1]);
+      int lo = hexValue(input[i + 2]);
+      if (hi < 0 || lo < 0) return false;
+      output += (char)((hi << 4) | lo);
+      i += 2;
+    } else if (c == '+') {
+      output += ' ';
+    } else {
+      output += c;
+    }
+  }
+  return true;
+}
+
+static bool loadStoredWiFiCredentials(String &ssid, String &pass) {
+  Preferences prefs;
+  if (!prefs.begin(WIFI_PREF_NAMESPACE, true)) {
+    Serial.println("WiFi prefs open failed; using defaults");
+    ssid = TEST_WIFI_SSID;
+    pass = TEST_WIFI_PASS;
+    return false;
+  }
+  ssid = prefs.getString(WIFI_PREF_SSID_KEY, "");
+  pass = prefs.getString(WIFI_PREF_PASS_KEY, "");
+  prefs.end();
+
+  if (ssid.length() == 0 && strlen(TEST_WIFI_SSID) > 0) {
+    ssid = TEST_WIFI_SSID;
+    pass = TEST_WIFI_PASS;
+  }
+  return true;
+}
+
+static bool saveStoredWiFiCredentials(const String &ssid, const String &pass) {
+  Preferences prefs;
+  if (!prefs.begin(WIFI_PREF_NAMESPACE, false)) {
+    Serial.println("WiFi prefs write open failed");
+    return false;
+  }
+  bool ok = prefs.putString(WIFI_PREF_SSID_KEY, ssid) == ssid.length();
+  ok = prefs.putString(WIFI_PREF_PASS_KEY, pass) == pass.length() && ok;
+  prefs.end();
+  return ok;
+}
+
+static bool parseWifiCredsV1(const String &line, String &ssid, String &pass) {
+  const String prefix = "WIFI_CREDS_V1 ";
+  if (!line.startsWith(prefix)) return false;
+
+  String payload = line.substring(prefix.length());
+  int sep = payload.indexOf(' ');
+  if (sep <= 0) return false;
+
+  String encodedSsid = payload.substring(0, sep);
+  String encodedPass = payload.substring(sep + 1);
+  if (!percentDecode(encodedSsid, ssid)) {
+    return false;
+  }
+  if (encodedPass == "%00") {
+    pass = "";
+  } else if (!percentDecode(encodedPass, pass)) {
+    return false;
+  }
+  return ssid.length() > 0 && ssid.length() <= 32 && pass.length() <= 64;
+}
+
+static bool parseLegacyWifiCreds(const String &line, String &ssid, String &pass) {
+  const String prefix = "WIFI_CREDS ";
+  if (!line.startsWith(prefix)) return false;
+
+  String payload = line.substring(prefix.length());
+  int sep = payload.indexOf(' ');
+  if (sep <= 0) return false;
+  ssid = payload.substring(0, sep);
+  pass = payload.substring(sep + 1);
+  ssid.trim();
+  pass.trim();
+  return ssid.length() > 0 && ssid.length() <= 32 && pass.length() <= 64;
+}
+
+static void handleWifiCredsCommand(const String &line) {
+  if (recording_enabled || mic_installed || speaker_playing || audioPlaybackActive) {
+    Serial.println("WIFI_CREDS busy; retry after mic/playback stops");
+    HmiSerial.print("ERR WIFI_CREDS_BUSY\n");
+    return;
+  }
+
+  String newSsid;
+  String newPass;
+  bool parsed = parseWifiCredsV1(line, newSsid, newPass) || parseLegacyWifiCreds(line, newSsid, newPass);
+  if (!parsed) {
+    Serial.println("Invalid WIFI_CREDS command");
+    HmiSerial.print("ERR WIFI_CREDS_BAD\n");
+    return;
+  }
+
+  String oldSsid;
+  String oldPass;
+  loadStoredWiFiCredentials(oldSsid, oldPass);
+  if (oldSsid == newSsid && oldPass == newPass) {
+    Serial.print("WiFi credentials already in sync: ");
+    Serial.println(newSsid);
+    HmiSerial.print("OK WIFI_CREDS_SAME\n");
+    return;
+  }
+
+  Serial.print("WiFi credentials updated from S3. New SSID: ");
+  Serial.println(newSsid);
+  if (!saveStoredWiFiCredentials(newSsid, newPass)) {
+    HmiSerial.print("ERR WIFI_CREDS_SAVE_FAILED\n");
+    return;
+  }
+
+  HmiSerial.print("OK WIFI_CREDS_SAVED_REBOOTING\n");
+  HmiSerial.flush();
+  Serial.println("Rebooting to apply WiFi credentials...");
+  delay(500);
+  ESP.restart();
+}
+
 static void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
+  String ssid;
+  String pass;
+  loadStoredWiFiCredentials(ssid, pass);
+  if (ssid.length() == 0) {
+    Serial.println("No WiFi credentials available");
+    return;
+  }
+
   Serial.print("Connecting WiFi: ");
-  Serial.println(TEST_WIFI_SSID);
+  Serial.println(ssid);
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false); // Test build: do not write WiFi config to flash.
@@ -807,7 +998,7 @@ static void connectWiFi() {
   delay(250);
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  WiFi.begin(TEST_WIFI_SSID, TEST_WIFI_PASS);
+  WiFi.begin(ssid.c_str(), pass.c_str());
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -1304,10 +1495,10 @@ static bool isKnownCommandPrefix(const String &line) {
          line == "REC_START" ||
          line == "REC_STOP" ||
          line == "MIC_TEST" ||
+         line.startsWith("WIFI_CREDS_V1 ") ||
          line.startsWith("WIFI_CREDS ") ||
-         line.startsWith("PLAY_URL ") ||
-         line.startsWith("http://") ||
-         line.startsWith("https://") ||
+         line.indexOf("PLAY_URL ") >= 0 ||
+         findAudioUrlStart(line) >= 0 ||
          line.indexOf("audio_url") >= 0;
 }
 
@@ -1324,11 +1515,10 @@ static void handleCommand(String line) {
     stopRecording();
   } else if (line == "MIC_TEST") {
     printMicLevelOnce();
+  } else if (line.startsWith("WIFI_CREDS_V1 ") || line.startsWith("WIFI_CREDS ")) {
+    handleWifiCredsCommand(line);
   } else if (audioUrl.length() > 0) {
     playUrl(audioUrl);
-  } else if (line.startsWith("WIFI_CREDS ")) {
-    Serial.println("WIFI_CREDS ignored in streaming test build; flash is untouched");
-    HmiSerial.print("OK WIFI_CREDS_IGNORED\n");
   } else if (line.length() > 0) {
     Serial.print("Unknown command: ");
     Serial.println(line);

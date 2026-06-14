@@ -47,6 +47,7 @@ static const uint32_t AUDIO_UART_BAUD = 460800;
 static bool ensureWiFi();
 static void playAudioUrl(const String &audio_url);
 static String readHttpResponse(WiFiClient &client, int *status_out);
+static void syncAudioBoardWiFiCredentials(bool force = false);
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
@@ -60,6 +61,10 @@ static volatile bool pending_voice_toggle = false;
 static bool recording = false;
 static uint8_t *pcm_buffer = nullptr;
 static size_t pcm_len = 0;
+static String current_wifi_ssid;
+static String current_wifi_password;
+static uint32_t last_wifi_creds_sync_ms = 0;
+static const uint32_t WIFI_CREDS_SYNC_INTERVAL_MS = 30000;
 
 static const uint8_t MAX_HISTORY_SESSIONS = 12;
 static String history_session_ids[MAX_HISTORY_SESSIONS];
@@ -502,6 +507,91 @@ static bool streamWavUrlToAudioBoard(const String &audio_url)
     return remaining == 0;
 }
 
+static bool isUnreservedUrlChar(char c)
+{
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '_' || c == '.' || c == '~';
+}
+
+static String percentEncode(const String &input)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    String out;
+    out.reserve(input.length() + 8);
+    for (size_t i = 0; i < input.length(); i++) {
+        uint8_t c = (uint8_t)input[i];
+        if (isUnreservedUrlChar((char)c)) {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[(c >> 4) & 0x0f];
+            out += hex[c & 0x0f];
+        }
+    }
+    return out;
+}
+
+static String encodeWiFiToken(const String &input)
+{
+    if (input.length() == 0) {
+        return "%00";
+    }
+    return percentEncode(input);
+}
+
+static void loadConfiguredWiFiCredentials(String &ssid, String &pass)
+{
+    Preferences prefs;
+    if (prefs.begin("wifi", true)) {
+        ssid = prefs.getString("ssid", "");
+        pass = prefs.getString("pass", "");
+        prefs.end();
+    } else {
+        ssid = "";
+        pass = "";
+    }
+
+    if (ssid.length() == 0 && strlen(DEFAULT_WIFI_SSID) > 0) {
+        ssid = DEFAULT_WIFI_SSID;
+        pass = DEFAULT_WIFI_PASSWORD;
+    }
+}
+
+static void syncAudioBoardWiFiCredentials(bool force)
+{
+    if (in_ap_mode || recording || WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    if (current_wifi_ssid.length() == 0) {
+        loadConfiguredWiFiCredentials(current_wifi_ssid, current_wifi_password);
+    }
+    if (current_wifi_ssid.length() == 0) {
+        return;
+    }
+
+    uint32_t now = millis();
+    if (!force && now - last_wifi_creds_sync_ms < WIFI_CREDS_SYNC_INTERVAL_MS) {
+        return;
+    }
+    last_wifi_creds_sync_ms = now;
+
+    String encoded_ssid = percentEncode(current_wifi_ssid);
+    String encoded_pass = encodeWiFiToken(current_wifi_password);
+    AudioSerial.print("WIFI_CREDS_V1 ");
+    AudioSerial.print(encoded_ssid);
+    AudioSerial.print(" ");
+    AudioSerial.print(encoded_pass);
+    AudioSerial.print("\n");
+
+    Serial.print("[HMI UART TX] WIFI_CREDS_V1 ssid=");
+    Serial.print(current_wifi_ssid);
+    Serial.print(" pass_len=");
+    Serial.println(current_wifi_password.length());
+}
+
 static void handleUsbCommand(String line)
 {
     line.trim();
@@ -557,19 +647,17 @@ static bool ensureWiFi()
         return false;
     }
 
-    Preferences prefs;
-    prefs.begin("wifi", true);
-    String ssid = prefs.getString("ssid", "");
-    String pass = prefs.getString("pass", "");
-    prefs.end();
+    String ssid;
+    String pass;
+    loadConfiguredWiFiCredentials(ssid, pass);
 
-    if (ssid.length() == 0 && strlen(DEFAULT_WIFI_SSID) > 0) {
-        ssid = DEFAULT_WIFI_SSID;
-        pass = DEFAULT_WIFI_PASSWORD;
-        Serial.println("No saved WiFi. Using default WiFi credentials from sketch.");
+    if (ssid == DEFAULT_WIFI_SSID && pass == DEFAULT_WIFI_PASSWORD) {
+        Serial.println("Using default WiFi credentials from sketch.");
     }
 
     if (ssid.length() > 0) {
+        current_wifi_ssid = ssid;
+        current_wifi_password = pass;
         Serial.print("Connecting to WiFi: ");
         Serial.println(ssid);
         WiFi.mode(WIFI_STA);
@@ -583,6 +671,7 @@ static bool ensureWiFi()
         if (WiFi.status() == WL_CONNECTED) {
             Serial.print("WiFi IP: ");
             Serial.println(WiFi.localIP());
+            syncAudioBoardWiFiCredentials(true);
             return true;
         }
         Serial.println("WiFi connect failed. Starting AP.");
@@ -617,13 +706,22 @@ static bool ensureWiFi()
         p.putString("ssid", nssid);
         p.putString("pass", npass);
         p.end();
+        current_wifi_ssid = nssid;
+        current_wifi_password = npass;
 
         String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head>"
                       "<body style='font-family:sans-serif; padding:20px;'><h2>Saved. Rebooting...</h2></body></html>";
         captive_server->send(200, "text/html", html);
 
-        AudioSerial.printf("WIFI_CREDS %s %s\n", nssid.c_str(), npass.c_str());
-        Serial.printf("[HMI UART TX] WIFI_CREDS %s %s\n", nssid.c_str(), npass.c_str());
+        String encoded_ssid = percentEncode(nssid);
+        String encoded_pass = encodeWiFiToken(npass);
+        AudioSerial.print("WIFI_CREDS_V1 ");
+        AudioSerial.print(encoded_ssid);
+        AudioSerial.print(" ");
+        AudioSerial.print(encoded_pass);
+        AudioSerial.print("\n");
+        AudioSerial.flush();
+        Serial.printf("[HMI UART TX] WIFI_CREDS_V1 ssid=%s pass_len=%u\n", nssid.c_str(), (unsigned)npass.length());
 
         delay(1000);
         ESP.restart();
@@ -1914,7 +2012,7 @@ static void pumpAudioSerial(uint32_t duration_ms = 0)
                             }
                         }
                         audio_uart_line = "";
-                    } else if (b != '\r' && audio_uart_line.length() < 80) {
+                    } else if (b != '\r' && audio_uart_line.length() < 192) {
                         audio_uart_line += (char)b;
                     }
                 }
@@ -2109,6 +2207,7 @@ void loop()
     }
 
     pumpAudioSerial();
+    syncAudioBoardWiFiCredentials();
 
     if (Serial.available()) {
         String line = Serial.readStringUntil('\n');

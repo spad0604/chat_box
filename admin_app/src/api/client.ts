@@ -1,5 +1,7 @@
 import type {
   AdminDocument,
+  CampusImage,
+  CampusImagesResponse,
   ChatMessage,
   ChatSession,
   Period,
@@ -84,6 +86,26 @@ export async function replaceDocument(documentId: number, file: File): Promise<v
 
 export async function deleteDocument(documentId: number): Promise<void> {
   await requestJson(`/documents/${documentId}`, {
+    method: "DELETE"
+  });
+}
+
+export async function fetchCampusImages(): Promise<CampusImage[]> {
+  const payload = await requestJson<CampusImagesResponse>("/campus-images");
+  return payload.images;
+}
+
+export async function uploadCampusImage(file: File): Promise<void> {
+  const formData = new FormData();
+  formData.append("file", file);
+  await requestJson("/campus-images", {
+    method: "POST",
+    body: formData
+  });
+}
+
+export async function deleteCampusImage(filename: string): Promise<void> {
+  await requestJson(`/campus-images/${encodeURIComponent(filename)}`, {
     method: "DELETE"
   });
 }

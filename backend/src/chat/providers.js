@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SYSTEM_INSTRUCTIONS, chatConfig } from './config.js';
+import { createSearchableDocument } from './documentSearch.js';
 
 export async function generateReply(message, sessionId, history = []) {
   if (chatConfig.llmProvider === 'mock') {
@@ -382,13 +383,19 @@ export async function uploadOpenAiDocument(file) {
   }
 
   const normalizedFile = await normalizeDocumentUpload(file);
+  const searchableDocument = await createSearchableDocument({
+    buffer: normalizedFile.buffer,
+    filename: normalizedFile.uploadName || normalizedFile.originalname,
+    displayName: normalizedFile.displayName || normalizedFile.originalname,
+    mimetype: normalizedFile.mimetype || normalizedFile.displayMimeType || '',
+  });
   const vectorStoreId = await getOrCreateVectorStoreId();
   const fileForm = new FormData();
   fileForm.set('purpose', 'assistants');
   fileForm.set(
     'file',
-    new Blob([normalizedFile.buffer], { type: normalizedFile.mimetype || 'application/octet-stream' }),
-    normalizedFile.uploadName || normalizedFile.originalname
+    new Blob([searchableDocument.buffer], { type: searchableDocument.mimetype }),
+    searchableDocument.uploadName
   );
 
   const fileResponse = await fetch('https://api.openai.com/v1/files', {
@@ -674,10 +681,14 @@ function normalizeTextFileBuffer(buffer, filename, mimetype) {
 function isTextLikeDocument(filename, mimetype) {
   const lowerName = filename.toLowerCase();
   const lowerType = mimetype.toLowerCase();
+  if (lowerType.includes('openxmlformats-officedocument')) {
+    return false;
+  }
   return (
     lowerType.startsWith('text/') ||
     lowerType.includes('json') ||
-    lowerType.includes('xml') ||
+    lowerType === 'application/xml' ||
+    lowerType.endsWith('+xml') ||
     ['.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm'].includes(path.extname(lowerName))
   );
 }
@@ -824,7 +835,7 @@ async function fetchWithRetry(url, options) {
   let response;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     response = await fetch(url, options);
-    if (![429, 500, 502, 503, 504].includes(response.status)) {
+    if (![429, 500, 502, 503, 504, 520].includes(response.status)) {
       return response;
     }
     await delay(1000 * (attempt + 1));

@@ -27,6 +27,7 @@ REC_START\n
 REC_STOP\n
 PLAY_URL http://server:8000/api/v1/audio/reply_x.wav\n
 PING\n
+WIFI_CREDS_V1 <percent_encoded_ssid> <percent_encoded_password>\n
 ```
 
 Response:
@@ -38,6 +39,22 @@ OK STOPPED\n
 OK PLAYING\n
 ERR message\n
 ```
+
+`WIFI_CREDS_V1` duoc ESP32-S3 gui sau khi bat duoc WiFi va lap lai moi 30 giay khi khong record.
+ESP32 DevKit V1 so sanh voi credential dang luu trong NVS `Preferences("wifi")`.
+Neu SSID/password khac, DevKit luu lai va tra:
+
+```text
+OK WIFI_CREDS_SAVED_REBOOTING\n
+```
+
+sau do tu reboot de connect lai bang WiFi giong ESP32-S3. Neu da giong nhau, DevKit tra:
+
+```text
+OK WIFI_CREDS_SAME\n
+```
+
+Password rong duoc encode thanh `%00`; cac ky tu dac biet/space trong SSID/password duoc percent-encode.
 
 Khi nhan `REC_START`, board audio se stream PCM16 mono 16 kHz lien tuc ve ESP32-S3 theo frame nhi phan:
 
