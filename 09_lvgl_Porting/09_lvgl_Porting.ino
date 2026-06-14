@@ -34,6 +34,8 @@ static const char *DEFAULT_WIFI_PASSWORD = "06042004";
 static const char *SERVER_HOST = "54.206.118.226";
 static const uint16_t SERVER_PORT = 8000;
 static const char *SERVER_BASE_URL = "http://54.206.118.226:8000";
+static const char *WAIT_PROMPT_TEXT = "Bạn chờ UniMate chút nhé.";
+static const char *WAIT_PROMPT_AUDIO_URL = "http://54.206.118.226:8000/api/v1/audio/reply_d1131ee5c9b0429b992b5e2cf9c52f7c.wav";
 static Board *global_board = nullptr;
 
 static const long GMT_OFFSET_SEC = 7 * 3600;
@@ -48,6 +50,7 @@ static bool ensureWiFi();
 static void playAudioUrl(const String &audio_url);
 static String readHttpResponse(WiFiClient &client, int *status_out);
 static void syncAudioBoardWiFiCredentials(bool force = false);
+static void waitForAudioPlaybackIdle(uint32_t timeout_ms);
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
@@ -60,6 +63,9 @@ static volatile bool pending_text_send = false;
 static volatile bool pending_voice_toggle = false;
 static bool recording = false;
 static bool audio_playback_in_flight = false;
+static uint32_t audio_playback_started_ms = 0;
+static uint32_t audio_playback_deadline_ms = 0;
+static const uint32_t AUDIO_PLAYBACK_ACK_TIMEOUT_MS = 15000;
 static uint8_t *pcm_buffer = nullptr;
 static size_t pcm_len = 0;
 static String current_wifi_ssid;
@@ -630,9 +636,14 @@ static void playAudioUrl(const String &audio_url)
     if (audio_url.length() == 0) {
         return;
     }
+    if (audio_playback_in_flight) {
+        waitForAudioPlaybackIdle(5000);
+    }
     String url = absoluteAudioUrl(audio_url);
     ui_status("Speaking...");
     audio_playback_in_flight = true;
+    audio_playback_started_ms = millis();
+    audio_playback_deadline_ms = audio_playback_started_ms + AUDIO_PLAYBACK_ACK_TIMEOUT_MS;
     AudioSerial.print("PLAY_URL ");
     AudioSerial.print(url);
     AudioSerial.print("\n");
@@ -977,8 +988,11 @@ static void handleChatResponse(const String &body)
         reply = "Server khong tra ve reply_text.";
     }
     ui_add("assistant", reply);
+    waitForAudioPlaybackIdle(15000);
     playAudioUrl(audio_url);
-    ui_status("Online");
+    if (audio_url.length() == 0) {
+        ui_status("Online");
+    }
 }
 
 static void handleVoiceChatResponse(const String &body)
@@ -991,9 +1005,16 @@ static void handleVoiceChatResponse(const String &body)
     handleChatResponse(body);
 }
 
+static void showWaitPrompt()
+{
+    ui_add("assistant", WAIT_PROMPT_TEXT);
+    playAudioUrl(WAIT_PROMPT_AUDIO_URL);
+    ui_status("Thinking...");
+}
+
 static void sendTextToServer(const String &text)
 {
-    ui_status("Thinking...");
+    showWaitPrompt();
     String payload = "{\"message\":\"" + jsonEscape(text) + "\",\"session_id\":\"" + jsonEscape(session_id) + "\"}";
     handleChatResponse(postJson("/api/v1/chat/text", payload));
 }
@@ -2010,10 +2031,12 @@ static void pumpAudioSerial(uint32_t duration_ms = 0)
                         if (audio_uart_line.length() > 0) {
                             Serial.print("Audio board: ");
                             Serial.println(audio_uart_line);
-                            if (audio_uart_line == "OK PLAY_DONE" || audio_uart_line == "OK PLAY_URL_DONE") {
+                            if (audio_uart_line.indexOf("OK PLAY_DONE") >= 0 ||
+                                audio_uart_line.indexOf("OK PLAY_URL_DONE") >= 0) {
                                 audio_playback_in_flight = false;
                                 ui_status("Online");
-                            } else if (audio_uart_line == "ERR PLAY_URL_FAILED") {
+                            } else if (audio_uart_line.indexOf("ERR PLAY_URL_FAILED") >= 0 ||
+                                       audio_uart_line.indexOf("ERR SPEAKER_BUSY") >= 0) {
                                 audio_playback_in_flight = false;
                                 ui_status("Error");
                             }
@@ -2044,11 +2067,35 @@ static void pumpAudioSerial(uint32_t duration_ms = 0)
                 }
             }
         }
+        if (audio_playback_in_flight &&
+            audio_playback_deadline_ms != 0 &&
+            (int32_t)(millis() - audio_playback_deadline_ms) >= 0) {
+            Serial.println("Audio playback ACK timeout; releasing UI playback lock");
+            audio_playback_in_flight = false;
+            audio_playback_deadline_ms = 0;
+            ui_status("Online");
+        }
         if (duration_ms == 0) {
             break;
         }
         delay(1);
     } while (millis() - start < duration_ms);
+}
+
+static void waitForAudioPlaybackIdle(uint32_t timeout_ms)
+{
+    uint32_t start = millis();
+    while (audio_playback_in_flight && millis() - start < timeout_ms) {
+        pumpAudioSerial(20);
+        delay(5);
+    }
+
+    if (audio_playback_in_flight) {
+        Serial.println("Audio playback wait timeout; releasing UI playback lock");
+        audio_playback_in_flight = false;
+        audio_playback_deadline_ms = 0;
+        ui_status("Online");
+    }
 }
 
 
@@ -2267,6 +2314,7 @@ void loop()
                 ui_add("assistant", "Khong thu duoc audio tu mic. Kiem tra firmware devkit audio/UART.");
                 ui_status("Error");
             } else {
+                showWaitPrompt();
                 handleVoiceChatResponse(postVoiceWav());
             }
         }

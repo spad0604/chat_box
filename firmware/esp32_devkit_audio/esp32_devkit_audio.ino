@@ -1433,6 +1433,7 @@ static bool playWavFromUrl(const String &audioUrl) {
                 (unsigned long)audioUnderruns);
 
   HmiSerial.print("OK PLAY_DONE\n");
+  HmiSerial.flush();
   speaker_playing = false;
   return true;
 }
@@ -1541,6 +1542,7 @@ static bool playUrl(const String &url) {
   speaker_playing = false;
   if (!ok) {
     HmiSerial.print("ERR PLAY_URL_FAILED\n");
+    HmiSerial.flush();
     Serial.println("PLAY_URL failed");
   }
   return ok;
