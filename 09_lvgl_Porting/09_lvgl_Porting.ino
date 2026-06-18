@@ -51,6 +51,7 @@ static void playAudioUrl(const String &audio_url);
 static String readHttpResponse(WiFiClient &client, int *status_out);
 static void syncAudioBoardWiFiCredentials(bool force = false);
 static void waitForAudioPlaybackIdle(uint32_t timeout_ms);
+static void updateWifiIndicator(bool force = false);
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
@@ -83,6 +84,7 @@ static uint32_t session_counter = 0;
 static bool time_synced = false;
 static uint32_t last_time_sync_ms = 0;
 static uint32_t last_clock_update_ms = 0;
+static bool last_wifi_ui_connected = false;
 
 static void halt_on_error(const char *message)
 {
@@ -105,6 +107,20 @@ static void ui_add(const char *role, const String &message)
 {
     if (lvgl_port_lock(200)) {
         ui_chat_add_message(role, message.c_str());
+        lvgl_port_unlock();
+    }
+}
+
+static void updateWifiIndicator(bool force)
+{
+    bool connected = !in_ap_mode && WiFi.status() == WL_CONNECTED;
+    if (!force && connected == last_wifi_ui_connected) {
+        return;
+    }
+
+    last_wifi_ui_connected = connected;
+    if (lvgl_port_lock(50)) {
+        ui_chat_set_wifi_connected(connected);
         lvgl_port_unlock();
     }
 }
@@ -2182,6 +2198,7 @@ void setup()
     lvgl_port_unlock();
 
     ensureWiFi();
+    updateWifiIndicator(true);
     if (in_ap_mode) {
         if (lvgl_port_lock(200)) {
             ui_chat_show_wifi_config_screen("UniMate-AP", "192.168.4.1");
@@ -2217,6 +2234,7 @@ void loop()
         } else {
             wifi_disconnect_time = 0;
         }
+        updateWifiIndicator();
     }
 
     if (pending_open_history) {
