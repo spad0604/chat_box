@@ -655,6 +655,30 @@ static void update_mic_recording_ui()
     }
 }
 
+static void update_dashboard_activity_hint(const char *status)
+{
+    if (!dashboard_mic_hint || !status || mic_is_recording) {
+        return;
+    }
+
+    if (strcmp(status, "Thinking...") == 0) {
+        lv_label_set_text(dashboard_mic_hint, "Thinking...");
+        lv_obj_set_style_text_color(dashboard_mic_hint, lv_color_hex(0x0089bf), 0);
+    } else if (strcmp(status, "Uploading...") == 0) {
+        lv_label_set_text(dashboard_mic_hint, "Đang gửi...");
+        lv_obj_set_style_text_color(dashboard_mic_hint, lv_color_hex(0x0089bf), 0);
+    } else if (strcmp(status, "Speaking...") == 0) {
+        lv_label_set_text(dashboard_mic_hint, "Đang trả lời...");
+        lv_obj_set_style_text_color(dashboard_mic_hint, lv_color_hex(0x0089bf), 0);
+    } else if (strcmp(status, "Error") == 0) {
+        lv_label_set_text(dashboard_mic_hint, "Có lỗi, thử lại nhé");
+        lv_obj_set_style_text_color(dashboard_mic_hint, lv_color_hex(0xe53935), 0);
+    } else {
+        lv_label_set_text(dashboard_mic_hint, "Nhấn để nói");
+        lv_obj_set_style_text_color(dashboard_mic_hint, lv_color_hex(0x2f6598), 0);
+    }
+}
+
 static void back_event_cb(lv_event_t *e)
 {
     LV_UNUSED(e);
@@ -816,10 +840,15 @@ static void create_dashboard()
 
     lv_obj_t *school = plain_obj(dashboard_screen);
     lv_obj_add_style(school, &style_pill, 0);
-    lv_obj_set_size(school, sx(104), sy(29));
+    // The old scaled size was only ~65 x 18 px on an 800 x 480 display,
+    // so the label wrapped and was clipped by the rounded badge.
+    lv_obj_set_size(school, at_least(sx(220), 170), at_least(sy(42), 34));
     lv_obj_align_to(school, brand, LV_ALIGN_OUT_RIGHT_MID, sx(10), 0);
     lv_obj_t *school_label = lv_label_create(school);
     lv_label_set_text(school_label, "FPT University");
+    lv_label_set_long_mode(school_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(school_label, LV_PCT(100));
+    lv_obj_set_style_text_align(school_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(school_label);
 
     lv_obj_t *time_box = plain_obj(dashboard_screen);
@@ -1150,7 +1179,13 @@ void ui_chat_clear_messages()
 
 void ui_chat_set_status(const char *status)
 {
-    if (!status_label || !status) {
+    if (!status) {
+        return;
+    }
+
+    update_dashboard_activity_hint(status);
+
+    if (!status_label) {
         return;
     }
 
